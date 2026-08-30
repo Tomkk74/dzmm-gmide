@@ -501,9 +501,154 @@ def save_config(updates: dict) -> dict:
     if cfg.get("origin"):
         cfg["origin"] = normalize_origin(cfg["origin"])
         ORIGIN = cfg["origin"]
+    # Keep recent project switch list in sync with current selection
+    if "character_id" in updates or "project_path" in updates:
+        cfg["project_history"] = _push_project_history(
+            cfg,
+            character_id=int(cfg.get("character_id") or 0),
+            project_path=str(cfg.get("project_path") or ""),
+            label=str(updates.get("project_label") or "").strip() or None,
+        )
+    cfg.pop("project_label", None)
     _atomic_write_text(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     _CONFIG_LOAD_ERROR = ""
     return cfg
+
+
+PROJECT_HISTORY_MAX = 12
+
+
+def _project_history_label(project_path: str, label: str | None = None) -> str:
+    if label and str(label).strip():
+        return str(label).strip()[:80]
+    raw = (project_path or "").strip()
+    if not raw:
+        return ""
+    try:
+        name = Path(raw).name
+    except Exception:
+        name = raw
+    return (name or raw)[:80]
+
+
+def normalize_project_history(raw) -> list[dict]:
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            cid = int(item.get("character_id") or 0)
+        except Exception:
+            cid = 0
+        path = str(item.get("project_path") or "").strip()
+        if cid <= 0 or not path:
+            continue
+        try:
+            path = str(normalize_project_root(path))
+        except Exception:
+            pass
+        key = f"{cid}|{path.replace('/', '\\').lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "character_id": cid,
+                "project_path": path,
+                "label": _project_history_label(path, item.get("label")),
+                "last_used": str(item.get("last_used") or ""),
+            }
+        )
+        if len(out) >= PROJECT_HISTORY_MAX:
+            break
+    return out
+
+
+def list_project_history(cfg: dict | None = None) -> list[dict]:
+    cfg = cfg if isinstance(cfg, dict) else load_config()
+    hist = normalize_project_history(cfg.get("project_history"))
+    # Ensure current project appears even if history was empty
+    try:
+        cid = int(cfg.get("character_id") or 0)
+    except Exception:
+        cid = 0
+    path = str(cfg.get("project_path") or "").strip()
+    if cid > 0 and path:
+        try:
+            path = str(normalize_project_root(path))
+        except Exception:
+            pass
+        key = f"{cid}|{path.replace('/', '\\').lower()}"
+        if not any(f"{h['character_id']}|{h['project_path'].replace('/', '\\').lower()}" == key for h in hist):
+            hist.insert(
+                0,
+                {
+                    "character_id": cid,
+                    "project_path": path,
+                    "label": _project_history_label(path),
+                    "last_used": "",
+                },
+            )
+            hist = hist[:PROJECT_HISTORY_MAX]
+    return hist
+
+
+def _push_project_history(
+    cfg: dict,
+    *,
+    character_id: int,
+    project_path: str,
+    label: str | None = None,
+) -> list[dict]:
+    from datetime import datetime, timezone
+
+    cid = int(character_id or 0)
+    path = str(project_path or "").strip()
+    if cid <= 0 or not path:
+        return normalize_project_history(cfg.get("project_history"))
+    try:
+        path = str(normalize_project_root(path))
+    except Exception:
+        pass
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {
+        "character_id": cid,
+        "project_path": path,
+        "label": _project_history_label(path, label),
+        "last_used": now,
+    }
+    key = f"{cid}|{path.replace('/', '\\').lower()}"
+    rest = []
+    for h in normalize_project_history(cfg.get("project_history")):
+        hk = f"{h['character_id']}|{h['project_path'].replace('/', '\\').lower()}"
+        if hk == key:
+            if h.get("label") and not label:
+                entry["label"] = h["label"]
+            continue
+        rest.append(h)
+    return [entry] + rest[: PROJECT_HISTORY_MAX - 1]
+
+
+def remove_project_history_entry(*, character_id: int, project_path: str) -> list[dict]:
+    cfg = load_config()
+    cid = int(character_id or 0)
+    path = str(project_path or "").strip()
+    try:
+        path = str(normalize_project_root(path)) if path else ""
+    except Exception:
+        pass
+    key = f"{cid}|{path.replace('/', '\\').lower()}"
+    hist = [
+        h
+        for h in normalize_project_history(cfg.get("project_history"))
+        if f"{h['character_id']}|{h['project_path'].replace('/', '\\').lower()}" != key
+    ]
+    cfg["project_history"] = hist
+    _atomic_write_text(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+    return hist
 
 
 def project_root() -> Path:
@@ -1144,8 +1289,27 @@ def proxy_url(game_id: str, path: str) -> str:
     return f"{get_origin()}/api/game-studio/proxy/{game_id}{path}"
 
 
+def _project_sync_skip() -> tuple[set[str], list[str]]:
+    path = ROOT / "_sync_skip.txt"
+    if not path.is_file():
+        return set(), []
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        norm = line.replace("\\", "/")
+        if norm.endswith("/"):
+            prefixes.append(norm)
+        else:
+            exact.add(norm)
+    return exact, prefixes
+
+
 def list_local_files() -> list[Path]:
     refresh_root()
+    extra_skip, extra_prefixes = _project_sync_skip()
     files: list[Path] = []
     for pattern in SYNC_GLOBS:
         for path in ROOT.glob(pattern):
@@ -1154,7 +1318,9 @@ def list_local_files() -> list[Path]:
             if any(part in SKIP_PARTS for part in path.parts):
                 continue
             rel_skip = path.relative_to(ROOT).as_posix()
-            if rel_skip in SYNC_SKIP_REL:
+            if rel_skip in SYNC_SKIP_REL or rel_skip in extra_skip:
+                continue
+            if any(rel_skip.startswith(p) for p in extra_prefixes):
                 continue
             files.append(path)
     # unique
@@ -1314,6 +1480,8 @@ def to_container_path(path: Path) -> str:
 def upload_file(cookie, token, game_id: str, local: Path) -> None:
     remote = to_container_path(local)
     data = local.read_bytes()
+    if not data:
+        data = b"\n"
     q = urllib.parse.urlencode({"path": remote, "createDirectories": "true"})
     st, raw, _ = http(
         proxy_url(game_id, f"/files/upload?{q}"),

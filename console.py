@@ -213,6 +213,7 @@ def build_status() -> dict:
         "error": error,
         "consoleMode": _console_mode_from_cfg(cfg),
         "preview": preview_snapshot(),
+        "projectHistory": studio.list_project_history(cfg),
     }
 
 
@@ -447,6 +448,8 @@ def do_save_config(body: dict) -> dict:
         updates["project_path"] = str(body.get("projectPath") or "").strip()
     if "previewPort" in body:
         updates["preview_port"] = int(body.get("previewPort") or 8791)
+    if "projectLabel" in body and str(body.get("projectLabel") or "").strip():
+        updates["project_label"] = str(body.get("projectLabel") or "").strip()
     if "origin" in body and str(body.get("origin") or "").strip():
         # 换线路：清 cookie，需重新登录
         origin = studio.set_origin(body.get("origin"), clear_cookie=True)
@@ -458,6 +461,18 @@ def do_save_config(body: dict) -> dict:
     elif env_email:
         studio._save_env(email=env_email)
     studio.refresh_root()
+    return {"ok": True, "status": build_status()}
+
+
+def do_remove_project_history(body: dict) -> dict:
+    try:
+        cid = int(body.get("characterId") or 0)
+    except Exception:
+        cid = 0
+    path = str(body.get("projectPath") or "").strip()
+    if cid <= 0 or not path:
+        return {"ok": False, "error": "缺少 characterId / projectPath", "status": build_status()}
+    studio.remove_project_history_entry(character_id=cid, project_path=path)
     return {"ok": True, "status": build_status()}
 
 
@@ -2710,6 +2725,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             result = do_save_config(body)
             _json(self, 200, result)
+            return
+        if path == "/api/config/history/remove":
+            result = do_remove_project_history(body)
+            _json(self, 200 if result.get("ok") else 400, result)
             return
         if path == "/api/logout":
             _json(self, 200, do_logout())

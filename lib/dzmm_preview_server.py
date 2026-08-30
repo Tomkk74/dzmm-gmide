@@ -260,6 +260,75 @@ BRIDGE_JS = r"""
     return { ok: false, error: "unknown_method", message: "未知操作" };
   }
 
+  function normalizeFnStreamPayload(obj) {
+    if (!obj || typeof obj !== "object") return null;
+    if (obj.end === true) return null;
+    if (obj.error) return obj;
+    if (obj.chunk && typeof obj.chunk === "object") return obj.chunk;
+    return obj;
+  }
+
+  async function* parseFnStreamResponse(res) {
+    const ct = String(res.headers.get("content-type") || "");
+    if (!ct.includes("event-stream") && !ct.includes("ndjson")) {
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+      if (!res.ok) {
+        const err = new Error((data && (data.error || data.message)) || ("HTTP " + res.status));
+        err.code = (data && data.code) || ("HTTP_" + res.status);
+        throw err;
+      }
+      const result = data && Object.prototype.hasOwnProperty.call(data, "result") ? data.result : data;
+      if (Array.isArray(result)) {
+        for (const chunk of result) {
+          const norm = normalizeFnStreamPayload(chunk);
+          if (norm) yield norm;
+        }
+      } else {
+        const norm = normalizeFnStreamPayload(result);
+        if (norm) yield norm;
+      }
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n");
+      buf = parts.pop() || "";
+      for (const line of parts) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let payload = trimmed;
+        if (trimmed.startsWith("data:")) payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          const norm = normalizeFnStreamPayload(JSON.parse(payload));
+          if (norm) yield norm;
+        } catch {}
+      }
+    }
+  }
+
+  const chatLsKey = "dzmm-preview-chat-v1";
+  function chatReadAll() {
+    try {
+      const raw = localStorage.getItem(chatLsKey);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { return []; }
+  }
+  function chatWriteAll(rows) {
+    try { localStorage.setItem(chatLsKey, JSON.stringify((rows || []).slice(-200))); } catch {}
+  }
+  function chatNewId() {
+    return "local-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+  }
+
   const dzmm = {
     __localPreviewBridge: true,
     toast: {
@@ -288,7 +357,7 @@ BRIDGE_JS = r"""
       async get() {
         return {
           kv: true, kvBatch: true, kvList: true, fn: true, completions: true,
-          draw: true, chat: false, share: false, workshop: true, audio: false, models: true,
+          draw: true, chat: true, share: false, workshop: true, audio: false, models: true,
         };
       },
     },
@@ -377,6 +446,55 @@ BRIDGE_JS = r"""
           console.warn("[local-dzmm] fn.invoke skip", name, e && e.message || e);
           return null;
         }
+      },
+      async *invokeStream(name, body) {
+        const res = await fetch(API + "/fn/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "text/event-stream, application/json" },
+          body: JSON.stringify({ name, body: body || {} }),
+        });
+        if (!res.ok && !String(res.headers.get("content-type") || "").includes("json")) {
+          const text = await res.text();
+          let msg = text;
+          try { msg = JSON.parse(text).error || text; } catch {}
+          const err = new Error(msg || ("fn stream HTTP " + res.status));
+          err.code = res.status === 404 ? "function_not_found" : ("HTTP_" + res.status);
+          throw err;
+        }
+        yield* parseFnStreamResponse(res);
+      },
+    },
+    chat: {
+      async list(ids) {
+        const all = chatReadAll();
+        if (!ids || !ids.length) return all;
+        const want = new Set(ids);
+        return all.filter((m) => want.has(m.id));
+      },
+      async insert(parentId, messages) {
+        const all = chatReadAll();
+        const now = new Date().toISOString();
+        const ids = [];
+        (messages || []).forEach((m) => {
+          const id = chatNewId();
+          ids.push(id);
+          all.push({
+            id,
+            role: m && m.role === "assistant" ? "assistant" : "user",
+            content: String((m && m.content) || ""),
+            timestamp: now,
+            parentId: parentId || (all.length ? all[all.length - 1].id : null),
+          });
+        });
+        chatWriteAll(all);
+        const last = all[all.length - 1] || null;
+        return { ids, id: ids[ids.length - 1] || null, message: last };
+      },
+      async timeline(messageId) {
+        const all = chatReadAll();
+        if (!messageId) return all.map((m) => m.id);
+        const idx = all.findIndex((m) => m.id === messageId);
+        return idx >= 0 ? all.slice(0, idx + 1).map((m) => m.id) : [];
       },
     },
     workshop: {
@@ -874,10 +992,12 @@ def make_handler(state: PreviewState):
                 return self._send(200, json.dumps(state.publish_status(), ensure_ascii=False).encode("utf-8"), "application/json")
             if path == "/_dzmm/proxy-image":
                 return self.proxy_draw_image(parsed)
+            if path.startswith("/api/draw/image/"):
+                return self.proxy_platform_draw_image(parsed)
             if path.startswith("/static/"):
                 return self.proxy_static(path[len("/static/") :])
             # Ren'Py Web 常请求 /game/...（无 /static 前缀）；视频用 <video src> 不走 fetch
-            if path.startswith("/game/") or path.startswith("/assets/") or path.endswith(
+            if path.startswith("/game/") or path.startswith("/assets/") or path.startswith("/fonts/") or path.endswith(
                 (
                     ".json",
                     ".js",
@@ -894,6 +1014,12 @@ def make_handler(state: PreviewState):
                     ".data",
                     ".zip",
                     ".html",
+                    ".woff",
+                    ".woff2",
+                    ".ttf",
+                    ".otf",
+                    ".ico",
+                    ".svg",
                 )
             ):
                 return self.proxy_static(path.lstrip("/"))
@@ -952,7 +1078,47 @@ def make_handler(state: PreviewState):
                     # 418 teapot / 404：预览桥返回空结果，避免控制台刷红
                     if st in (404, 418, 501, 503):
                         return self._send(200, json.dumps({"result": None, "skipped": True, "status": st}).encode("utf-8"), "application/json")
+                    if st == 200 and name == "native-draw":
+                        try:
+                            obj = json.loads(raw.decode("utf-8"))
+                            result = obj.get("result") if isinstance(obj, dict) and "result" in obj else obj
+                            if isinstance(result, dict) and isinstance(result.get("images"), list):
+                                result["images"] = [self._local_draw_image(str(u)) for u in result["images"]]
+                                if isinstance(obj, dict) and "result" in obj:
+                                    obj["result"] = result
+                                    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                                else:
+                                    raw = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                        except Exception:
+                            pass
                     ctype = hdr.get("Content-Type") or "application/json"
+                    return self._send(st, raw, ctype)
+                if path == "/_dzmm/fn/stream":
+                    name = str(body.get("name") or "")
+                    fn_body = body.get("body") or {}
+                    st, raw, hdr = state.upstream(
+                        "POST",
+                        f"{_origin()}/api/gamefy/{state.character_id}/fn/{urllib.parse.quote(name)}",
+                        body=json.dumps(fn_body).encode("utf-8"),
+                        content_type="application/json",
+                        accept="text/event-stream, application/x-ndjson, application/json",
+                    )
+                    if st in (404, 418, 501, 503):
+                        err = json.dumps(
+                            {
+                                "error": {
+                                    "code": "function_not_found",
+                                    "message": f"函数 {name} 不可用（HTTP {st}）。请先 sync 到容器。",
+                                }
+                            },
+                            ensure_ascii=False,
+                        )
+                        return self._send(
+                            200,
+                            ("data: " + err + "\n\n").encode("utf-8"),
+                            "text/event-stream; charset=utf-8",
+                        )
+                    ctype = hdr.get("Content-Type") or "text/event-stream"
                     return self._send(st, raw, ctype)
                 if path == "/_dzmm/workshop/list":
                     # bool 必须编成 true/false；urlencode(True) 会变成 True，平台报「请求参数有误」
@@ -982,7 +1148,8 @@ def make_handler(state: PreviewState):
 
         def _local_static_path(self, rel: str):
             """Resolve publish/ file path when present locally."""
-            rel = urllib.parse.urlsplit(rel).path.lstrip("/").replace("\\", "/")
+            # Browsers request spaced names as %20; Path must see real spaces.
+            rel = urllib.parse.unquote(urllib.parse.urlsplit(rel).path.lstrip("/").replace("\\", "/"))
             if ".." in rel.split("/"):
                 return None
             candidates = [
@@ -1265,6 +1432,40 @@ def make_handler(state: PreviewState):
                 return self._send(
                     502,
                     json.dumps({"error": f"image proxy failed: {e}"}).encode("utf-8"),
+                    "application/json",
+                )
+
+        def proxy_platform_draw_image(self, parsed):
+            """kagami / native-draw 返回 /api/draw/image/... 相对链，本地预览需带登录态转发上游。"""
+            url = _origin() + parsed.path
+            if parsed.query:
+                url += "?" + parsed.query
+            try:
+                st, raw, headers = state.upstream("GET", url, accept="image/*,*/*")
+                if st >= 400 or not raw:
+                    req = urllib.request.Request(
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 DZMM-Local-Preview",
+                            "Accept": "image/*,*/*",
+                            "Referer": _origin() + "/",
+                        },
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        raw = resp.read()
+                        headers = dict(resp.headers)
+                        st = resp.status
+                if st >= 400 or not raw:
+                    return self._send(st or 502, b'{"error":"draw image fetch failed"}', "application/json")
+                ctype = str(headers.get("Content-Type") or headers.get("content-type") or "image/jpeg").split(";")[0].strip()
+                if not ctype.startswith("image/"):
+                    ctype = "image/jpeg"
+                return self._send(200, raw, ctype)
+            except Exception as e:
+                return self._send(
+                    502,
+                    json.dumps({"error": f"draw image proxy failed: {e}"}).encode("utf-8"),
                     "application/json",
                 )
 

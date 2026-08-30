@@ -2013,6 +2013,94 @@
     }
   }
 
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function normPathKey(p) {
+    return String(p || '').replace(/\//g, '\\').toLowerCase();
+  }
+
+  function renderProjectHistory(status) {
+    var list = $('projectHistoryList');
+    var empty = $('projectHistoryEmpty');
+    if (!list) return;
+    var hist = (status && status.projectHistory) || [];
+    var curCid = String((status && status.characterId) || ($('characterId') && $('characterId').value) || '');
+    var curPath = normPathKey((status && status.projectPath) || ($('projectPath') && $('projectPath').value) || '');
+    if (!hist.length) {
+      list.innerHTML = '';
+      if (empty) empty.hidden = false;
+      return;
+    }
+    if (empty) empty.hidden = true;
+    list.innerHTML = hist.map(function (it) {
+      var cid = String(it.character_id || '');
+      var path = String(it.project_path || '');
+      var label = String(it.label || path || cid);
+      var active = cid === curCid && normPathKey(path) === curPath;
+      return (
+        '<li class="project-history-item' + (active ? ' is-active' : '') + '" data-cid="' + escapeHtml(cid) + '" data-path="' + escapeHtml(path) + '">' +
+          '<button type="button" class="project-history-main" data-act="switch" title="切换到此项目">' +
+            '<span class="project-history-name">' + escapeHtml(label) + (active ? ' · 当前' : '') + '</span>' +
+            '<span class="project-history-meta">#' + escapeHtml(cid) + ' · ' + escapeHtml(path) + '</span>' +
+          '</button>' +
+          '<button type="button" class="project-history-remove" data-act="remove" title="从历史移除">×</button>' +
+        '</li>'
+      );
+    }).join('');
+  }
+
+  async function switchProjectFromHistory(cid, path) {
+    if (!cid || !path) return;
+    try {
+      var syncState = await api('/api/sync');
+      if (syncState && syncState.job && syncState.job.running) {
+        showMsg('同步进行中，请先等同步结束再切换项目', false);
+        return;
+      }
+    } catch (_) {}
+    setBusy(true);
+    try {
+      var data = await api('/api/config', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: $('email') ? $('email').value.trim() : undefined,
+          characterId: cid,
+          projectPath: path,
+          previewPort: $('previewPort') ? $('previewPort').value : undefined,
+        }),
+      });
+      if (data.status) fillForm(data.status);
+      showMsg(data.ok ? ('已切换到 #' + cid + ' · ' + path) : (data.error || '切换失败'), !!data.ok);
+    } catch (e) {
+      showMsg(String(e.message || e), false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeProjectFromHistory(cid, path) {
+    if (!cid || !path) return;
+    setBusy(true);
+    try {
+      var data = await api('/api/config/history/remove', {
+        method: 'POST',
+        body: JSON.stringify({ characterId: cid, projectPath: path }),
+      });
+      if (data.status) fillForm(data.status);
+      showMsg(data.ok ? '已从历史移除' : (data.error || '移除失败'), !!data.ok);
+    } catch (e) {
+      showMsg(String(e.message || e), false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function fillForm(status, opts) {
     opts = opts || {};
     if (!status) return;
@@ -2021,6 +2109,7 @@
     if (status.projectPath) $('projectPath').value = status.projectPath;
     if (status.previewPort) $('previewPort').value = status.previewPort;
     fillOriginSelect(status);
+    renderProjectHistory(status);
     var pathHint = $('projectPathHint');
     if (pathHint) {
       var resolveErr = status.projectResolveError || '';
@@ -2456,6 +2545,25 @@
       setBusy(false);
     }
   });
+
+  if ($('projectHistoryList')) {
+    $('projectHistoryList').addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t) return;
+      var btn = t.closest ? t.closest('[data-act]') : null;
+      if (!btn) return;
+      var row = btn.closest ? btn.closest('.project-history-item') : null;
+      if (!row) return;
+      var cid = row.getAttribute('data-cid') || '';
+      var path = row.getAttribute('data-path') || '';
+      var act = btn.getAttribute('data-act');
+      if (act === 'switch') {
+        switchProjectFromHistory(cid, path);
+      } else if (act === 'remove') {
+        removeProjectFromHistory(cid, path);
+      }
+    });
+  }
 
   ['logoutBtn', 'logoutBtn2', 'logoutBtn3', 'logoutBtn4'].forEach(function (id) {
     if ($(id)) $(id).addEventListener('click', runLogout);

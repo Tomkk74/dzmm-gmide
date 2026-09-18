@@ -4,13 +4,13 @@
   <strong>🌉 Local Bridge · 游戏卡云端桥 · 角色卡本地写 / 试玩 · 一键同步发布</strong>
   <br/><br/>
   <a href="https://discord.gg/da9PMeAGGK"><img src="https://img.shields.io/badge/Discord-交流群-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/Tomkk74/DZMM-yunduan-"><img src="https://img.shields.io/badge/GitHub-仓库-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub"></a>
+  <a href="https://github.com/Tomkk74/dzmm-gmide"><img src="https://img.shields.io/badge/GitHub-仓库-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub"></a>
   <img src="https://img.shields.io/badge/Python-3-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT">
 </p>
 
 > 💬 **交流群（Discord）** → [https://discord.gg/da9PMeAGGK](https://discord.gg/da9PMeAGGK)  
-> 📦 **仓库** → [https://github.com/Tomkk74/DZMM-yunduan-](https://github.com/Tomkk74/DZMM-yunduan-)
+> 📦 **仓库** → [https://github.com/Tomkk74/dzmm-gmide](https://github.com/Tomkk74/dzmm-gmide)
 
 本机 Web 控制台，两种模式互不混用：
 
@@ -41,8 +41,8 @@
 **只用这一套入口**（不要再直接跑 `console.py`）：
 
 ```bat
-git clone https://github.com/Tomkk74/DZMM-yunduan-.git
-cd DZMM-yunduan-
+git clone https://github.com/Tomkk74/dzmm-gmide.git
+cd dzmm-gmide
 start.bat
 ```
 

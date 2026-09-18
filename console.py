@@ -124,14 +124,21 @@ def _claim_project_job(kind: str, init: dict) -> str:
         return ""
 
 
+_CLIENT_DISCONNECT = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
 def _json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(raw)))
-    handler.send_header("Cache-Control", "no-store")
-    handler.end_headers()
-    handler.wfile.write(raw)
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(raw)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(raw)
+    except _CLIENT_DISCONNECT:
+        # 浏览器刷新/切页/取消轮询时会先断连接，响应写不完 — 正常，不必打栈
+        pass
 
 
 def _read_body(handler: BaseHTTPRequestHandler) -> dict:
@@ -2291,12 +2298,15 @@ def _serve_card_asset(handler: BaseHTTPRequestHandler, local_id: str, rel: str) 
         return
     ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     raw = file_path.read_bytes()
-    handler.send_response(200)
-    handler.send_header("Content-Type", ctype)
-    handler.send_header("Content-Length", str(len(raw)))
-    handler.send_header("Cache-Control", "no-store")
-    handler.end_headers()
-    handler.wfile.write(raw)
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", ctype)
+        handler.send_header("Content-Length", str(len(raw)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(raw)
+    except _CLIENT_DISCONNECT:
+        pass
 
 
 def do_card_cloud_list(quick: bool = False) -> dict:
@@ -2861,12 +2871,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         data = file_path.read_bytes()
         ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
+        except _CLIENT_DISCONNECT:
+            pass
 
 
 def _try_auto_preview() -> None:

@@ -14,6 +14,7 @@
 | 步骤 key | 界面含义 | 主要数据 |
 | --- | --- | --- |
 | `basic` | 基础信息 | 名称、简介、性格、场景、系统指令、创作者备注、标签、头像/立绘 |
+| `interact` | 互动模板（本地控制台） | `extensions.status_template`、推荐模型 |
 | `worldbook` | 世界设定 / 世界书 | `character_book` |
 | `dialogue` | 开场对话 | `chat_history`（多轮 user/assistant）、建议回复 |
 | `voice` | 音色 | `voice_settings` |
@@ -36,7 +37,49 @@
 | 立绘/封面图 | `data.image_info[]` | `{url,name,isHidden,triggerKeywords}`，至少一个 |
 | （兼容）开场白 | `data.first_mes` | 完整模式更偏向对话步骤；仍可能出现在导出结构里 |
 | 备选问候 | `data.alternate_greetings[]` | 出现在 data 属性表中 |
-| 扩展 | `data.extensions` | |
+| 扩展 | `data.extensions` | 含 `recommended_model`、`status_template` 等 |
+
+## 1b. 互动模板 `interact`（专业模式 · 核心身份）
+
+官网「互动模板」≠「详细描述·插入模板」。聊天页状态面板 / 剧情选项。
+
+落盘：`卡/<名>/extensions.json` → `data.extensions`
+
+| 字段 | 说明 |
+| --- | --- |
+| `extensions.recommended_model` | 新建聊天默认模型（可选） |
+| `extensions.status_template` | 互动模板本体；未启用时省略 |
+
+`status_template` 结构：
+
+```json
+{
+  "version": 1,
+  "templates": ["status_bar", "relationship", "inventory", "options"],
+  "panels": [{ "id": "panel_1", "title": "自定义" }],
+  "fields": [
+    {
+      "key": "time",
+      "template": "status_bar",
+      "label": "时间",
+      "type": "text",
+      "initial": "未知",
+      "hint": "可选"
+    }
+  ],
+  "options": { "count": 3, "hint": "可选" },
+  "theme": null
+}
+```
+
+| 项 | 值 |
+| --- | --- |
+| 官方模板 id | `status_bar` / `relationship` / `inventory` / `options` |
+| field.type | `text` / `number` / `meter` / `list` |
+| field.key | `^[a-z][a-z0-9_]{0,31}$` |
+| 无新 tRPC | 随 `saveDraft` / `uploadOrUpdate` 的 rawData 上传 |
+
+本地控制台：写卡 Tab「互动模板」编辑；pull/publish 透传。
 
 ## 2. 世界书 `worldbook`（世界设定）
 

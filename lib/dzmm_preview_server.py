@@ -7,12 +7,14 @@ Open: http://127.0.0.1:8791/ (character 3355944)
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
 import mimetypes
 import re
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -108,8 +110,14 @@ BRIDGE_JS = r"""
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
     if (!res.ok) {
-      const err = new Error((data && (data.error || data.message)) || ("HTTP " + res.status));
-      err.code = (data && data.code) || (res.status === 418 ? "captcha_required" : ("HTTP_" + res.status));
+      const rawErr = data && (data.error || data.message);
+      const msg = typeof rawErr === "string"
+        ? rawErr
+        : (rawErr && typeof rawErr.message === "string" ? rawErr.message : ("HTTP " + res.status));
+      const err = new Error(msg);
+      err.code = (typeof rawErr === "object" && rawErr && rawErr.code)
+        || (data && data.code)
+        || (res.status === 418 ? "captcha_required" : ("HTTP_" + res.status));
       err.status = res.status;
       throw err;
     }
@@ -329,12 +337,47 @@ BRIDGE_JS = r"""
     return "local-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
   }
 
+  const audioEls = new Map();
+  let audioMuted = false;
+  try { audioMuted = localStorage.getItem("dzmm-preview-audio-muted") === "1"; } catch {}
+  let saveActionHandler = null;
+  let launchParamsConsumed = false;
+  let launchParamsCache = null;
+
+  function makeKvStore(prefix) {
+    const pfx = String(prefix || "");
+    const store = {
+      async get(key) { return dzmm.kv.get(pfx + key); },
+      async put(key, value, opts) { return dzmm.kv.put(pfx + key, value, opts); },
+      async delete(key) { return dzmm.kv.delete(pfx + key); },
+      async batchGet(keys) {
+        return dzmm.kv.batchGet((keys || []).map((k) => pfx + k));
+      },
+      async batchPut(entries) {
+        const mapped = {};
+        Object.keys(entries || {}).forEach((k) => { mapped[pfx + k] = entries[k]; });
+        return dzmm.kv.batchPut(mapped);
+      },
+      async list(options) {
+        const opt = Object.assign({}, options || {});
+        const sub = String(opt.prefix || "");
+        opt.prefix = pfx + sub;
+        const page = await dzmm.kv.list(opt);
+        const keys = (page.keys || []).map((k) => (k.startsWith(pfx) ? k.slice(pfx.length) : k));
+        return { keys, cursor: page.cursor };
+      },
+      namespace(sub) { return makeKvStore(pfx + String(sub || "")); },
+    };
+    return store;
+  }
+
   const dzmm = {
     __localPreviewBridge: true,
     toast: {
       info: (m) => console.info("[toast:info]", m),
       success: (m) => console.info("[toast:success]", m),
       warn: (m) => console.warn("[toast:warn]", m),
+      warning: (m) => console.warn("[toast:warning]", m),
       error: (m) => console.error("[toast:error]", m),
     },
     loading: {
@@ -351,14 +394,33 @@ BRIDGE_JS = r"""
         console.log("[loading]", phase || p, p && p.message || "");
       },
       ready: () => console.log("[loading] ready"),
-      error: (m) => console.error("[loading]", m),
+      error: (code, message) => console.error("[loading]", code, message || ""),
     },
     capabilities: {
       async get() {
         return {
-          kv: true, kvBatch: true, kvList: true, fn: true, completions: true,
-          draw: true, chat: true, share: false, workshop: true, audio: false, models: true,
+          kv: true,
+          kvBatch: true,
+          kvList: true,
+          fn: true,
+          completions: true,
+          draw: true,
+          drawStatus: true,
+          chat: true,
+          share: true,
+          workshop: true,
+          audio: true,
+          models: true,
+          loading: true,
+          user: true,
+          toast: true,
+          environment: "dev",
         };
+      },
+    },
+    errors: {
+      isDzmmError(err) {
+        return !!(err && typeof err === "object" && (err.code || err.name === "DzmmError"));
       },
     },
     completions,
@@ -382,7 +444,7 @@ BRIDGE_JS = r"""
         }
         return toRaShape(null);
       },
-      async put(key, value) {
+      async put(key, value, _opts) {
         kvMem.set(key, value);
         kvLsWrite(key, value);
         try {
@@ -401,6 +463,50 @@ BRIDGE_JS = r"""
           console.warn("[local-dzmm] kv.delete cloud fail", key, e.message);
         }
       },
+      async batchGet(keys) {
+        const list = Array.isArray(keys) ? keys.slice(0, 10) : [];
+        const out = {};
+        for (const key of list) {
+          const row = await this.get(key);
+          out[key] = row && Object.prototype.hasOwnProperty.call(row, "value") ? row.value : null;
+        }
+        return out;
+      },
+      async batchPut(entries) {
+        const keys = Object.keys(entries || {}).slice(0, 10);
+        for (const key of keys) {
+          await this.put(key, entries[key]);
+        }
+      },
+      async list(options) {
+        const prefix = String((options && options.prefix) || "");
+        const limit = Math.max(1, Math.min(100, Number((options && options.limit) || 20) || 20));
+        const cursor = String((options && options.cursor) || "");
+        // 本地预览：合并内存 + localStorage 前缀扫描（平台 list 语义近似）
+        const found = new Set();
+        for (const k of kvMem.keys()) {
+          if (!prefix || String(k).startsWith(prefix)) found.add(String(k));
+        }
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (!k) continue;
+            let real = k;
+            if (k.startsWith(kvLsPrefix)) real = k.slice(kvLsPrefix.length);
+            if (!prefix || real.startsWith(prefix)) found.add(real);
+          }
+        } catch {}
+        const sorted = Array.from(found).sort();
+        let start = 0;
+        if (cursor) {
+          const idx = sorted.indexOf(cursor);
+          start = idx >= 0 ? idx + 1 : 0;
+        }
+        const page = sorted.slice(start, start + limit);
+        const next = start + limit < sorted.length ? page[page.length - 1] : undefined;
+        return { keys: page, cursor: next };
+      },
+      namespace(prefix) { return makeKvStore(prefix); },
     },
     models: {
       async list() {
@@ -410,8 +516,58 @@ BRIDGE_JS = r"""
     },
     draw: {
       async generate(input) {
-        // 服务端会创建任务并轮询到完成，返回 SDK 形状 { taskId, images, status }
         return api("/draw/generate", { method: "POST", body: input || {} });
+      },
+      async edit(input) {
+        const body = Object.assign({}, input || {});
+        const imgs = Array.isArray(body.images) ? body.images : [];
+        const out = [];
+        for (const img of imgs) {
+          if (typeof img === "string" && img.startsWith("data:")) {
+            const blob = await (await fetch(img)).blob();
+            const fd = new FormData();
+            const ext = (blob.type || "").includes("webp") ? "webp" : ((blob.type || "").includes("jpeg") || (blob.type || "").includes("jpg") ? "jpg" : "png");
+            fd.append("image", blob, "ref." + ext);
+            const res = await fetch(API + "/draw/upload-ref", { method: "POST", body: fd });
+            const text = await res.text();
+            let data = null;
+            try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+            if (!res.ok) {
+              const msg = (data && (data.error || data.message)) || ("upload HTTP " + res.status);
+              const err = new Error(typeof msg === "string" ? msg : "参考图上传失败");
+              err.code = (data && data.code) || ("HTTP_" + res.status);
+              err.status = res.status;
+              throw err;
+            }
+            if (!data || !data.url) throw new Error("参考图上传未返回 URL");
+            out.push(data.url);
+          } else {
+            out.push(img);
+          }
+        }
+        body.images = out;
+        return api("/draw/edit", { method: "POST", body });
+      },
+      async status(taskId) {
+        return api("/draw/status", { method: "POST", body: { taskId: String(taskId || "") } });
+      },
+      download(id) {
+        const tid = String(id || "").trim();
+        if (!tid) return;
+        const a = document.createElement("a");
+        a.href = API + "/draw/download?taskId=" + encodeURIComponent(tid);
+        a.download = "draw-" + tid + ".png";
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      },
+      nav(id) {
+        const tid = String(id || "").trim();
+        if (!tid) return;
+        // 打开平台绘图详情（带登录态的站点）
+        const origin = (window.__DZMM_ORIGIN__ || "https://www.dzmm.ai").replace(/\/$/, "");
+        window.open(origin + "/draw/" + encodeURIComponent(tid), "_blank", "noopener,noreferrer");
       },
       async generateModels() {
         return api("/draw/models?kind=generate");
@@ -421,8 +577,7 @@ BRIDGE_JS = r"""
       },
     },
     fn: {
-      async invoke(name, body) {
-        // 本地预览：游戏侧 HarborGuard 若误走 platform 模式，仍给可用票据
+      async invoke(name, body, _opts) {
         if (String(name || "") === "harbor_guard") {
           const method = String((body && body.method) || "issue");
           const now = Date.now();
@@ -433,21 +588,25 @@ BRIDGE_JS = r"""
           const token = "local-" + now.toString(36) + "-" + Math.random().toString(36).slice(2, 10);
           return { ok: true, token, exp: now + ttl, ttlMs: ttl, local: true };
         }
-        // 留言板：本地预览不打云端函数（常 429/502），用内存模拟分页
         if (String(name || "") === "board") {
           return localBoardInvoke(body || {});
         }
         try {
           const data = await api("/fn/invoke", { method: "POST", body: { name, body: body || {} } });
-          // 线上 HTTP 包一层 { result }；SDK 对浏览器直接返回函数返回值
           return data && Object.prototype.hasOwnProperty.call(data, "result") ? data.result : data;
         } catch (e) {
-          // 418 = 平台未开通/限流的自定义函数，预览里忽略即可
-          console.warn("[local-dzmm] fn.invoke skip", name, e && e.message || e);
+          const detail = (e && e.message) || (e && e.code) || String(e);
+          console.warn("[local-dzmm] fn.invoke skip", name, detail);
+          if (e && (e.status === 429 || e.code === "HTTP_429" || e.code === "RATE_LIMITED")) {
+            const err = new Error(detail || "Too Many Requests");
+            err.code = "RATE_LIMITED";
+            err.status = 429;
+            throw err;
+          }
           return null;
         }
       },
-      async *invokeStream(name, body) {
+      async *invokeStream(name, body, _opts) {
         const res = await fetch(API + "/fn/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json", Accept: "text/event-stream, application/json" },
@@ -456,9 +615,22 @@ BRIDGE_JS = r"""
         if (!res.ok && !String(res.headers.get("content-type") || "").includes("json")) {
           const text = await res.text();
           let msg = text;
-          try { msg = JSON.parse(text).error || text; } catch {}
-          const err = new Error(msg || ("fn stream HTTP " + res.status));
-          err.code = res.status === 404 ? "function_not_found" : ("HTTP_" + res.status);
+          let code = "";
+          try {
+            const parsed = JSON.parse(text);
+            msg = parsed.error || parsed.message || text;
+            code = parsed.code || "";
+          } catch {}
+          if (!code && res.status === 409) code = "dev_container_inactive";
+          else if (!code && res.status === 404) code = "function_not_found";
+          else if (!code) code = "HTTP_" + res.status;
+          if (!msg || !String(msg).trim()) {
+            msg = res.status === 409
+              ? "开发容器未运行，请在工作台启动预览容器"
+              : ("fn stream HTTP " + res.status);
+          }
+          const err = new Error(msg);
+          err.code = code;
           throw err;
         }
         yield* parseFnStreamResponse(res);
@@ -505,7 +677,102 @@ BRIDGE_JS = r"""
     },
     user: {
       async info() { return api("/user"); },
-      async jwks() { return { keys: [] }; },
+      async jwks() {
+        try { return await api("/jwks"); }
+        catch { return { keys: [] }; }
+      },
+    },
+    save: {
+      onAction(handler) {
+        if (typeof handler === "function") saveActionHandler = handler;
+        return () => { if (saveActionHandler === handler) saveActionHandler = null; };
+      },
+      /** 本地控制台调试：手动触发 reset / prepareDeleteRecord */
+      async __debugTrigger(type) {
+        if (!saveActionHandler) return { ok: false, error: "no_handler" };
+        return await saveActionHandler({ type: String(type || "reset") });
+      },
+    },
+    audio: {
+      play(key, opts) {
+        try {
+          const id = String(key || "");
+          if (!id) return;
+          let el = audioEls.get(id);
+          if (!el) {
+            el = document.createElement("audio");
+            el.preload = "auto";
+            // 相对游戏资源路径；也可传完整 URL
+            el.src = id.startsWith("http") || id.startsWith("/") || id.startsWith("blob:") || id.startsWith("data:")
+              ? id
+              : ("/" + id.replace(/^\/+/, ""));
+            audioEls.set(id, el);
+          }
+          el.loop = !!(opts && opts.loop);
+          el.volume = audioMuted ? 0 : Math.max(0, Math.min(1, Number((opts && opts.volume) ?? 1) || 1));
+          const p = el.play();
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        } catch (e) {
+          console.warn("[local-dzmm] audio.play", e);
+        }
+      },
+      stop(key) {
+        try {
+          if (key == null || key === "") {
+            audioEls.forEach((el) => { try { el.pause(); el.currentTime = 0; } catch {} });
+            return;
+          }
+          const el = audioEls.get(String(key));
+          if (el) { el.pause(); el.currentTime = 0; }
+        } catch {}
+      },
+      setMuted(muted) {
+        audioMuted = !!muted;
+        try { localStorage.setItem("dzmm-preview-audio-muted", audioMuted ? "1" : "0"); } catch {}
+        audioEls.forEach((el) => { try { el.muted = audioMuted; if (audioMuted) el.volume = 0; } catch {} });
+      },
+      isMuted() { return !!audioMuted; },
+    },
+    async share(input) {
+      const params = String((input && input.params) || "").slice(0, 1024);
+      const mode = String((input && input.mode) || "sheet");
+      const text = String((input && input.text) || "来玩这个游戏");
+      const info = await api("/user").catch(() => ({}));
+      const from = (info && info.id) || "local-dev";
+      const url = new URL(location.href);
+      url.searchParams.set("from", String(from));
+      if (params) url.searchParams.set("gp", params);
+      const shareUrl = url.toString();
+      if (mode === "url") return { url: shareUrl, shared: false };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(shareUrl);
+          console.info("[toast:info]", "已复制分享链接（本地预览）");
+        } else {
+          console.info("[share]", text, shareUrl);
+        }
+      } catch {
+        console.info("[share]", text, shareUrl);
+      }
+      return { url: shareUrl, shared: true };
+    },
+    async getLaunchParams() {
+      if (launchParamsConsumed && launchParamsCache) return launchParamsCache;
+      const qs = new URLSearchParams(location.search || "");
+      const from = qs.get("from");
+      const gp = qs.get("gp");
+      launchParamsCache = { from: from || null, gp: gp || null };
+      launchParamsConsumed = true;
+      // 对齐平台：读一次后清掉 URL 参数，避免刷新串台
+      try {
+        if (from || gp) {
+          qs.delete("from");
+          qs.delete("gp");
+          const next = location.pathname + (qs.toString() ? ("?" + qs.toString()) : "") + (location.hash || "");
+          history.replaceState(null, "", next);
+        }
+      } catch {}
+      return launchParamsCache;
     },
   };
 
@@ -513,7 +780,7 @@ BRIDGE_JS = r"""
   window.dispatchEvent(new Event("dzmm:ready"));
   try { document.dispatchEvent(new Event("dzmm:ready")); } catch {}
   try { window.postMessage({ type: "dzmm:ready" }, "*"); } catch {}
-  console.info("[local-dzmm] bridge ready");
+  console.info("[local-dzmm] bridge ready (platform-parity)");
 })();
 """
 
@@ -854,9 +1121,11 @@ class PreviewState:
             headers["Content-Type"] = content_type
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         last_err = None
+        # 画图上传 / edit 轮询可能较慢
+        req_timeout = 120 if ("/draw" in url or "uploadCharacterImage" in url) else 45
         for attempt in range(2):
             try:
-                with urllib.request.urlopen(req, timeout=45) as resp:
+                with urllib.request.urlopen(req, timeout=req_timeout) as resp:
                     return resp.status, resp.read(), dict(resp.headers)
             except urllib.error.HTTPError as e:
                 try:
@@ -874,8 +1143,8 @@ class PreviewState:
 
 def make_handler(state: PreviewState):
     class Handler(BaseHTTPRequestHandler):
-        # 大资源并发时避免单连接拖太久
-        timeout = 60
+        # 改图上传 + 轮询可能超过默认 60s
+        timeout = 180
 
         def log_message(self, fmt, *args):
             # 静态资源日志太多会堵控制台管道 / 拖慢线程，只打 API / 错误
@@ -983,11 +1252,15 @@ def make_handler(state: PreviewState):
                     json.dumps(state.user_info(), ensure_ascii=False).encode("utf-8"),
                     "application/json",
                 )
+            if path == "/_dzmm/jwks":
+                return self.proxy_jwks()
             if path == "/_dzmm/models":
                 return self.proxy_chat_models()
             if path == "/_dzmm/draw/models":
                 kind = urllib.parse.parse_qs(parsed.query).get("kind", ["generate"])[0]
                 return self.proxy_draw_models(kind)
+            if path == "/_dzmm/draw/download":
+                return self.proxy_draw_download(parsed)
             if path == "/_dzmm/studio/publish":
                 return self._send(200, json.dumps(state.publish_status(), ensure_ascii=False).encode("utf-8"), "application/json")
             if path == "/_dzmm/proxy-image":
@@ -1031,6 +1304,9 @@ def make_handler(state: PreviewState):
             if not path.startswith("/_dzmm/"):
                 self._send(404, b"not found")
                 return
+            # 改图参考：multipart 先上传到平台，再交给 edit（对齐真实 SDK）
+            if path == "/_dzmm/draw/upload-ref":
+                return self.proxy_draw_upload_ref()
             body = self._read_json()
             try:
                 if path == "/_dzmm/completions":
@@ -1045,6 +1321,10 @@ def make_handler(state: PreviewState):
                     return self.proxy_chat_models()
                 if path == "/_dzmm/draw/generate":
                     return self.proxy_draw_generate(body)
+                if path == "/_dzmm/draw/edit":
+                    return self.proxy_draw_edit(body)
+                if path == "/_dzmm/draw/status":
+                    return self.proxy_draw_status(body)
                 if path == "/_dzmm/auth/reload":
                     state.refresh(force=True)
                     remain_sec = max(0, state._remain_now())
@@ -1068,13 +1348,20 @@ def make_handler(state: PreviewState):
                 if path == "/_dzmm/fn/invoke":
                     name = str(body.get("name") or "")
                     fn_body = body.get("body") or {}
+                    url = f"{_origin()}/api/gamefy/{state.character_id}/fn/{urllib.parse.quote(name)}"
+                    payload = json.dumps(fn_body).encode("utf-8")
                     st, raw, hdr = state.upstream(
                         "POST",
-                        f"{_origin()}/api/gamefy/{state.character_id}/fn/{urllib.parse.quote(name)}",
-                        body=json.dumps(fn_body).encode("utf-8"),
+                        url,
+                        body=payload,
                         content_type="application/json",
                         accept="application/json",
                     )
+                    # 禁止对 429 自动重试：平台同游戏最多 5 路 in-flight，
+                    # 再打一次只会把「换一版」点成连环占坑，兼职扩写尤其伤。
+                    ctype = hdr.get("Content-Type") or "application/json"
+                    if st == 429:
+                        return self._send(st, raw, ctype)
                     # 418 teapot / 404：预览桥返回空结果，避免控制台刷红
                     if st in (404, 418, 501, 503):
                         return self._send(200, json.dumps({"result": None, "skipped": True, "status": st}).encode("utf-8"), "application/json")
@@ -1091,7 +1378,6 @@ def make_handler(state: PreviewState):
                                     raw = json.dumps(result, ensure_ascii=False).encode("utf-8")
                         except Exception:
                             pass
-                    ctype = hdr.get("Content-Type") or "application/json"
                     return self._send(st, raw, ctype)
                 if path == "/_dzmm/fn/stream":
                     name = str(body.get("name") or "")
@@ -1103,6 +1389,22 @@ def make_handler(state: PreviewState):
                         content_type="application/json",
                         accept="text/event-stream, application/x-ndjson, application/json",
                     )
+                    if st == 409:
+                        # Workbench 开发会话：容器休眠时平台返回 409，不会静默跑 prod 快照
+                        err = json.dumps(
+                            {
+                                "error": {
+                                    "code": "dev_container_inactive",
+                                    "message": "开发容器未运行。请打开工作台启动预览容器后再试。",
+                                }
+                            },
+                            ensure_ascii=False,
+                        )
+                        return self._send(
+                            200,
+                            ("data: " + err + "\n\n").encode("utf-8"),
+                            "text/event-stream; charset=utf-8",
+                        )
                     if st in (404, 418, 501, 503):
                         err = json.dumps(
                             {
@@ -1336,6 +1638,112 @@ def make_handler(state: PreviewState):
             except Exception as e:
                 return self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
 
+        def proxy_jwks(self):
+            try:
+                st, raw, _ = state.upstream(
+                    "GET",
+                    f"{_origin()}/api/gamefy/.well-known/jwks.json",
+                    accept="application/json",
+                )
+                if st == 200 and raw:
+                    return self._send(200, raw, "application/json")
+            except Exception as e:
+                print(f"[preview] jwks fail: {e}", flush=True)
+            return self._send(200, b'{"keys":[]}', "application/json")
+
+        def proxy_draw_status(self, body: dict):
+            """对齐 draw.status：只读任务并重签图片 URL，不轮询等待。"""
+            task_id = str((body or {}).get("taskId") or "").strip()
+            if not task_id:
+                return self._send(
+                    400,
+                    json.dumps({"error": "Missing taskId", "code": "INVALID_REQUEST"}).encode(),
+                    "application/json",
+                )
+            st, raw, _ = state.upstream(
+                "GET",
+                f"{_origin()}/api/gamefy/draw/status?taskId={urllib.parse.quote(task_id)}",
+                accept="application/json",
+            )
+            if st == 404:
+                return self._send(
+                    404,
+                    json.dumps({"error": "Draw task not found", "code": "KEY_NOT_FOUND"}).encode(),
+                    "application/json",
+                )
+            if st != 200:
+                return self._send(st, raw, "application/json")
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return self._send(502, b'{"error":"invalid draw status response"}', "application/json")
+            task = obj.get("task") or {}
+            status = task.get("status") or obj.get("status") or ""
+            images = task.get("outputImages") or obj.get("images") or []
+            if not isinstance(images, list):
+                images = []
+            result = {
+                "taskId": task_id,
+                "images": [self._local_draw_image(str(u)) for u in images if u],
+                "createdAt": task.get("createdAt") or obj.get("createdAt") or "",
+                "status": status or "unknown",
+                "errorMessage": task.get("errorMessage") or obj.get("errorMessage") or None,
+            }
+            return self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json")
+
+        def proxy_draw_download(self, parsed):
+            """对齐 draw.download：带登录态拉图并以 attachment 返回。"""
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            task_id = str((qs.get("taskId") or qs.get("id") or [""])[0] or "").strip()
+            if not task_id:
+                return self._send(400, b'{"error":"Missing taskId"}', "application/json")
+            st, raw, _ = state.upstream(
+                "GET",
+                f"{_origin()}/api/gamefy/draw/status?taskId={urllib.parse.quote(task_id)}",
+                accept="application/json",
+            )
+            if st != 200:
+                return self._send(st or 502, raw or b'{"error":"status failed"}', "application/json")
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return self._send(502, b'{"error":"invalid status"}', "application/json")
+            task = obj.get("task") or {}
+            images = task.get("outputImages") or []
+            if not isinstance(images, list) or not images:
+                return self._send(404, b'{"error":"no image","code":"KEY_NOT_FOUND"}', "application/json")
+            img_url = self._abs_draw_image(str(images[0]))
+            # 优先平台 download 链
+            dl = f"{_origin()}/api/draw/image/{urllib.parse.quote(task_id)}?index=0&download=1"
+            try:
+                st2, raw2, headers = state.upstream("GET", dl, accept="image/*,*/*")
+                if st2 >= 400 or not raw2:
+                    st2, raw2, headers = state.upstream("GET", img_url, accept="image/*,*/*")
+                if st2 >= 400 or not raw2:
+                    return self._send(502, b'{"error":"image fetch failed"}', "application/json")
+                ctype = str(headers.get("Content-Type") or headers.get("content-type") or "image/png").split(";")[0].strip()
+                if not ctype.startswith("image/"):
+                    ctype = "image/png"
+                # attachment download
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(raw2)))
+                    self.send_header("Content-Disposition", f'attachment; filename="draw-{task_id}.png"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(raw2)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+                    pass
+                return None
+            except Exception as e:
+                return self._send(
+                    502,
+                    json.dumps({"error": f"download failed: {e}"}).encode("utf-8"),
+                    "application/json",
+                )
+
         def proxy_draw_models(self, kind: str = "generate"):
             kind = kind if kind in ("generate", "edit") else "generate"
             st, raw, _ = state.upstream(
@@ -1469,6 +1877,236 @@ def make_handler(state: PreviewState):
                     "application/json",
                 )
 
+        def _upstream_edit_image(self, url: str) -> str:
+            """把本地预览改写过的画图链还原成上游可认的 URL；data URL 先上传再返回。"""
+            if not url:
+                return url
+            raw = str(url).strip()
+            if raw.startswith("data:"):
+                return self._upload_data_url_to_platform(raw)
+            # 同源绝对链 → 只取 path+query
+            try:
+                parsed = urllib.parse.urlparse(raw)
+            except Exception:
+                parsed = None
+            path_q = raw
+            if parsed and parsed.scheme in ("http", "https") and parsed.path:
+                path_q = parsed.path + (("?" + parsed.query) if parsed.query else "")
+            if path_q.startswith("/_dzmm/proxy-image"):
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(path_q).query or "")
+                real = str((qs.get("url") or [""])[0] or "").strip()
+                if real:
+                    return real
+            if raw.startswith("http://") or raw.startswith("https://"):
+                return raw
+            if raw.startswith("/"):
+                return _origin() + raw
+            return raw
+
+        def _parse_multipart_image(self) -> tuple[bytes, str]:
+            ctype = str(self.headers.get("Content-Type") or "")
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                raise ValueError("空请求体")
+            if length > 12 * 1024 * 1024:
+                raise ValueError("参考图过大（上限约 12MB）")
+            raw = self.rfile.read(length)
+            if "multipart/form-data" not in ctype.lower():
+                # 兼容 JSON { image: dataUrl }
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except Exception as e:
+                    raise ValueError("需要 multipart 或 JSON data URL") from e
+                data_url = str((obj or {}).get("image") or "")
+                if not data_url.startswith("data:"):
+                    raise ValueError("JSON 需含 image data URL")
+                return self._decode_data_url(data_url)
+            m = re.search(r"boundary=([^;]+)", ctype, flags=re.I)
+            if not m:
+                raise ValueError("multipart 缺少 boundary")
+            boundary = m.group(1).strip().strip('"')
+            marker = ("--" + boundary).encode("ascii", "ignore")
+            parts = raw.split(marker)
+            for part in parts:
+                if b"Content-Disposition" not in part:
+                    continue
+                head, _, content = part.partition(b"\r\n\r\n")
+                if not content:
+                    continue
+                if b'name="image"' not in head and b"filename=" not in head:
+                    continue
+                blob = content
+                if blob.endswith(b"\r\n"):
+                    blob = blob[:-2]
+                if blob.endswith(b"--"):
+                    blob = blob[:-2]
+                if blob.endswith(b"\r\n"):
+                    blob = blob[:-2]
+                fname = "ref.png"
+                fm = re.search(br'filename="([^"]+)"', head)
+                if fm:
+                    try:
+                        fname = fm.group(1).decode("utf-8", "replace")
+                    except Exception:
+                        fname = "ref.png"
+                return blob, fname
+            raise ValueError("multipart 未找到 image 字段")
+
+        def _decode_data_url(self, data_url: str) -> tuple[bytes, str]:
+            # data:image/png;base64,....
+            head, _, b64 = data_url.partition(",")
+            if not b64:
+                raise ValueError("无效 data URL")
+            mime = "image/png"
+            m = re.match(r"data:([^;]+)", head, flags=re.I)
+            if m:
+                mime = (m.group(1) or mime).strip().lower()
+            ext = "png"
+            if "jpeg" in mime or "jpg" in mime:
+                ext = "jpg"
+            elif "webp" in mime:
+                ext = "webp"
+            elif "gif" in mime:
+                ext = "gif"
+            raw = base64.b64decode(b64, validate=False)
+            if not raw:
+                raise ValueError("空图片")
+            if len(raw) > 10 * 1024 * 1024:
+                raise ValueError("参考图过大（上限 10MB）")
+            return raw, f"ref.{ext}"
+
+        def _upload_ref_bytes(self, image_bytes: bytes, filename: str = "ref.png") -> str:
+            """走平台 studio.uploadCharacterImage，返回可给 draw.edit 用的 URL。"""
+            if not image_bytes:
+                raise ValueError("空图片")
+            fname = Path(filename or "ref.png").name or "ref.png"
+            low = fname.lower()
+            if low.endswith((".jpg", ".jpeg")):
+                mime = "image/jpeg"
+            elif low.endswith(".webp"):
+                mime = "image/webp"
+            elif low.endswith(".gif"):
+                mime = "image/gif"
+            else:
+                mime = "image/png"
+                if not low.endswith(".png"):
+                    fname = "ref.png"
+            boundary = "----dzmm" + uuid.uuid4().hex
+            body = b"".join(
+                [
+                    f"--{boundary}\r\n".encode(),
+                    f'Content-Disposition: form-data; name="image"; filename="{fname}"\r\n'.encode(),
+                    f"Content-Type: {mime}\r\n\r\n".encode(),
+                    image_bytes,
+                    b"\r\n",
+                    f"--{boundary}--\r\n".encode(),
+                ]
+            )
+            st, raw, _ = state.upstream(
+                "POST",
+                f"{_origin()}/api/trpc/studio.uploadCharacterImage?batch=1",
+                body=body,
+                content_type=f"multipart/form-data; boundary={boundary}",
+                accept="application/json",
+            )
+            if st != 200:
+                msg = raw[:300].decode("utf-8", "replace")
+                try:
+                    obj = json.loads(raw.decode("utf-8", "replace"))
+                    msg = str(obj.get("error") or obj.get("message") or msg)
+                except Exception:
+                    pass
+                raise RuntimeError(f"参考图上传失败 HTTP {st}: {msg}")
+            obj = json.loads(raw.decode("utf-8", "replace"))
+            if isinstance(obj, list) and obj:
+                data = (((obj[0] or {}).get("result") or {}).get("data") or {}).get("json") or {}
+            else:
+                data = (((obj or {}).get("result") or {}).get("data") or {}).get("json") or {}
+            url = data.get("image_url") or data.get("url")
+            if not url:
+                raise RuntimeError("参考图上传未返回 URL")
+            return str(url)
+
+        def _upload_data_url_to_platform(self, data_url: str) -> str:
+            raw, fname = self._decode_data_url(data_url)
+            return self._upload_ref_bytes(raw, fname)
+
+        def proxy_draw_upload_ref(self):
+            """本地桥：把参考图上传到平台，返回 { url }。"""
+            try:
+                raw, fname = self._parse_multipart_image()
+                url = self._upload_ref_bytes(raw, fname)
+                return self._send(200, json.dumps({"url": url}, ensure_ascii=False).encode("utf-8"), "application/json")
+            except ValueError as e:
+                return self._send(
+                    400,
+                    json.dumps({"error": str(e), "code": "INVALID_IMAGE_DATA"}).encode("utf-8"),
+                    "application/json",
+                )
+            except Exception as e:
+                return self._send(
+                    502,
+                    json.dumps({"error": str(e), "code": "UPLOAD_FAILED"}).encode("utf-8"),
+                    "application/json",
+                )
+
+        def _poll_draw_task(self, task_id: str, fail_label: str = "Draw generation"):
+            deadline = time.time() + 120
+            delay = 1.0
+            last_raw = b""
+            while time.time() < deadline:
+                st, last_raw, _ = state.upstream(
+                    "GET",
+                    f"{_origin()}/api/gamefy/draw/status?taskId={urllib.parse.quote(str(task_id))}",
+                    accept="application/json",
+                )
+                if st == 200:
+                    try:
+                        obj = json.loads(last_raw.decode("utf-8"))
+                    except Exception:
+                        obj = {}
+                    task = obj.get("task") or {}
+                    status = task.get("status")
+                    if status in ("pending", "processing"):
+                        time.sleep(delay)
+                        delay = min(delay + 0.5, 4.0)
+                        continue
+                    if status == "failed":
+                        return self._send(
+                            400,
+                            json.dumps(
+                                {
+                                    "error": task.get("errorMessage") or f"{fail_label} failed",
+                                    "code": task.get("errorCode") or "CREATE_TASK_FAILED",
+                                }
+                            ).encode(),
+                            "application/json",
+                        )
+                    images = task.get("outputImages") or []
+                    if not isinstance(images, list) or not images:
+                        return self._send(
+                            502,
+                            json.dumps(
+                                {"error": f"{fail_label} returned no images", "code": "NO_OUTPUT_IMAGES"}
+                            ).encode(),
+                            "application/json",
+                        )
+                    result = {
+                        "taskId": task_id,
+                        "images": [self._local_draw_image(str(u)) for u in images],
+                        "createdAt": task.get("createdAt") or "",
+                        "status": status or "completed",
+                        "errorMessage": task.get("errorMessage") or None,
+                    }
+                    return self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json")
+                time.sleep(delay)
+                delay = min(delay + 0.5, 4.0)
+            return self._send(
+                504,
+                json.dumps({"error": f"{fail_label} timed out", "code": "DRAW_TIMEOUT"}).encode(),
+                "application/json",
+            )
+
         def proxy_draw_generate(self, body: dict):
             """对齐真实 SDK：POST /draw 创建任务，再轮询 /draw/status 直到 completed。"""
             payload = dict(body or {})
@@ -1501,60 +2139,44 @@ def make_handler(state: PreviewState):
             task_id = created.get("taskId") or (created.get("task") or {}).get("id")
             if not task_id:
                 return self._send(502, b'{"error":"Missing draw task identifier"}', "application/json")
+            return self._poll_draw_task(task_id, "Draw generation")
 
-            deadline = time.time() + 120
-            delay = 1.0
-            last_raw = b""
-            while time.time() < deadline:
-                st, last_raw, _ = state.upstream(
-                    "GET",
-                    f"{_origin()}/api/gamefy/draw/status?taskId={urllib.parse.quote(str(task_id))}",
-                    accept="application/json",
-                )
-                if st == 200:
-                    try:
-                        obj = json.loads(last_raw.decode("utf-8"))
-                    except Exception:
-                        obj = {}
-                    task = obj.get("task") or {}
-                    status = task.get("status")
-                    if status in ("pending", "processing"):
-                        time.sleep(delay)
-                        delay = min(delay + 0.5, 4.0)
-                        continue
-                    if status == "failed":
-                        return self._send(
-                            400,
-                            json.dumps(
-                                {
-                                    "error": task.get("errorMessage") or "Draw generation failed",
-                                    "code": task.get("errorCode") or "CREATE_TASK_FAILED",
-                                }
-                            ).encode(),
-                            "application/json",
-                        )
-                    images = task.get("outputImages") or []
-                    if not isinstance(images, list) or not images:
-                        return self._send(
-                            502,
-                            json.dumps({"error": "Draw generation returned no images", "code": "NO_OUTPUT_IMAGES"}).encode(),
-                            "application/json",
-                        )
-                    result = {
-                        "taskId": task_id,
-                        "images": [self._local_draw_image(str(u)) for u in images],
-                        "createdAt": task.get("createdAt") or "",
-                        "status": status or "completed",
-                        "errorMessage": task.get("errorMessage") or None,
-                    }
-                    return self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json")
-                time.sleep(delay)
-                delay = min(delay + 0.5, 4.0)
-            return self._send(
-                504,
-                json.dumps({"error": "Draw generation timed out", "code": "DRAW_TIMEOUT"}).encode(),
-                "application/json",
+        def proxy_draw_edit(self, body: dict):
+            """对齐真实 SDK：POST /draw/edit，再轮询 status；参考图还原上游 URL。"""
+            payload = dict(body or {})
+            images = payload.get("images")
+            if isinstance(images, list):
+                payload["images"] = [self._upstream_edit_image(str(u)) for u in images if u]
+            if state.chat_id:
+                payload["chatId"] = state.chat_id
+            st, raw, _ = state.upstream(
+                "POST",
+                f"{_origin()}/api/gamefy/draw/edit",
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+                accept="application/json",
             )
+            if st != 200:
+                return self._send(st, raw, "application/json")
+            try:
+                created = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return self._send(502, b'{"error":"invalid draw edit response"}', "application/json")
+            if created.get("success") is False:
+                return self._send(
+                    400,
+                    json.dumps(
+                        {
+                            "error": created.get("message") or "Draw edit failed",
+                            "code": created.get("code") or "CREATE_TASK_FAILED",
+                        }
+                    ).encode(),
+                    "application/json",
+                )
+            task_id = created.get("taskId") or (created.get("task") or {}).get("id")
+            if not task_id:
+                return self._send(502, b'{"error":"Missing draw edit task identifier"}', "application/json")
+            return self._poll_draw_task(task_id, "Draw edit")
 
         def serve_index(self):
             html = None
@@ -1583,7 +2205,10 @@ def make_handler(state: PreviewState):
                 if st != 200:
                     return self._send(502, f"index load failed HTTP {st}".encode())
                 html = raw.decode("utf-8", "replace")
-            inject = f"<script>{BRIDGE_JS}</script><base href=\"/static/\">"
+            inject = (
+                f"<script>window.__DZMM_ORIGIN__={json.dumps(_origin(), ensure_ascii=False)};</script>"
+                f"<script>{BRIDGE_JS}</script><base href=\"/static/\">"
+            )
             if re.search(r"<head[^>]*>", html, flags=re.I):
                 html = re.sub(r"(<head[^>]*>)", lambda m: m.group(1) + inject, html, count=1, flags=re.I)
             else:

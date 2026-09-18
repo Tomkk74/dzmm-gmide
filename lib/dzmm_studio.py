@@ -715,6 +715,9 @@ SYNC_GLOBS = [
     "icons.svg",
     "使用说明.txt",
     "assets/**/*",
+    # 扁平玩家包（根目录即入口）常见结构
+    "src/**/*",
+    "data/**/*",
 ]
 
 SYNC_SKIP_REL = {

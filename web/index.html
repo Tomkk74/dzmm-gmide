@@ -6,35 +6,73 @@
   <title>DZMM 本地开发控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1f24'/%3E%3Ctext x='16' y='22' text-anchor='middle' fill='%23e8e6e3' font-size='14' font-family='Segoe UI,sans-serif'%3ED%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="./app.css">
+  <script>
+    try {
+      if (localStorage.getItem('dzmm-console-ui-theme') === 'unity') {
+        document.documentElement.setAttribute('data-ui-theme', 'unity');
+      }
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <div class="app" id="appShell">
+    <!-- Unity 布局专用顶栏（经典模式隐藏） -->
+    <header class="unity-menubar unity-only" id="unityMenubar" aria-label="菜单栏">
+      <div class="unity-logo" title="DZMM 本地控制台" aria-hidden="true">
+        <span class="unity-logo-mark">控</span>
+      </div>
+      <nav class="unity-menu-items" aria-label="菜单">
+        <span class="unity-menu-item">文件</span>
+        <span class="unity-menu-item">编辑</span>
+        <span class="unity-menu-item">资源</span>
+        <span class="unity-menu-item">对象</span>
+        <span class="unity-menu-item">组件</span>
+        <span class="unity-menu-item">窗口</span>
+        <span class="unity-menu-item">帮助</span>
+      </nav>
+      <div class="unity-menubar-right">
+        <span class="unity-menubar-title">DZMM 控制台</span>
+        <span id="unityMenubarLamp" class="unity-menubar-lamp">离线</span>
+        <button type="button" class="unity-tool-btn" id="sidebarCollapseBtnUnity" title="收起面板，预览全屏">最大化</button>
+      </div>
+    </header>
+
     <aside class="sidebar" id="sidebar">
-      <div class="brand">
-        <div>
-          <p class="eyebrow">LOCAL BRIDGE</p>
-          <h1>DZMM 控制台</h1>
+      <div class="hier-dock" id="hierDock">
+        <div class="unity-dock-head unity-only">
+          <span class="unity-dock-tab active">层级</span>
+          <span class="unity-dock-tools" aria-hidden="true">+</span>
         </div>
-        <div class="brand-right">
-          <div id="lamp" class="lamp off" title="登录状态">未登录</div>
-          <button type="button" class="btn icon" id="sidebarCollapseBtn" title="收起侧栏，游戏全屏">收起</button>
+        <div class="brand">
+          <div>
+            <p class="eyebrow">本地桥接</p>
+            <h1>DZMM 控制台</h1>
+          </div>
+          <div class="brand-right">
+            <div id="lamp" class="lamp off" title="登录状态">未登录</div>
+            <button type="button" class="btn icon" id="sidebarCollapseBtn" title="收起侧栏，游戏全屏">收起</button>
+          </div>
         </div>
+
+        <nav class="mode-switch" aria-label="卡类型切换">
+          <button type="button" class="mode-item active" id="modeGameBtn" data-mode="game">游戏卡</button>
+          <button type="button" class="mode-item" id="modeCardBtn" data-mode="card">角色卡</button>
+        </nav>
+
+        <nav class="menu" id="gameMenu" aria-label="游戏卡菜单">
+          <button type="button" class="menu-item" data-panel="bridge">云端桥接</button>
+          <button type="button" class="menu-item active" data-panel="login">账号登录</button>
+          <button type="button" class="menu-item" data-panel="project">项目配置</button>
+          <button type="button" class="menu-item" data-panel="pull">拉取容器</button>
+          <button type="button" class="menu-item" data-panel="status">运行状态</button>
+        </nav>
       </div>
 
-      <nav class="mode-switch" aria-label="卡类型切换">
-        <button type="button" class="mode-item active" id="modeGameBtn" data-mode="game">游戏卡</button>
-        <button type="button" class="mode-item" id="modeCardBtn" data-mode="card">角色卡</button>
-      </nav>
-
-      <nav class="menu" id="gameMenu" aria-label="游戏卡菜单">
-        <button type="button" class="menu-item" data-panel="bridge">云端桥接</button>
-        <button type="button" class="menu-item active" data-panel="login">账号登录</button>
-        <button type="button" class="menu-item" data-panel="project">项目配置</button>
-        <button type="button" class="menu-item" data-panel="pull">拉取容器</button>
-        <button type="button" class="menu-item" data-panel="status">运行状态</button>
-      </nav>
-
-      <div class="sidebar-scroll">
+      <div class="insp-dock" id="inspDock">
+        <div class="unity-dock-head unity-only">
+          <span class="unity-dock-tab active">检视</span>
+        </div>
+        <div class="sidebar-scroll">
         <section class="panel" id="panel-bridge" data-panel="bridge" hidden>
           <h2>云端桥接</h2>
           <div id="bridgeCard" class="bridge-card off">
@@ -173,7 +211,7 @@
             <div class="actions">
               <button type="submit" class="btn">保存配置</button>
               <button type="button" class="btn accent" id="pingBtn">连接编辑器</button>
-              <a class="btn" id="workbenchLink" href="#" target="_blank" rel="noopener">Workbench</a>
+              <a class="btn" id="workbenchLink" href="#" target="_blank" rel="noopener">工作台</a>
             </div>
           </form>
           <div class="project-history" id="projectHistoryWrap">
@@ -248,11 +286,17 @@
       <div class="sidebar-foot">
         <p id="msg" class="msg" hidden></p>
       </div>
+      </div>
     </aside>
 
     <main class="stage">
       <div id="gameStage" class="stage-mode">
         <header class="stage-bar">
+          <div class="unity-scene-tabs unity-only" aria-label="视图">
+            <span class="unity-scene-tab">场景</span>
+            <span class="unity-scene-tab active">游戏</span>
+            <span class="unity-scene-tab">资源商店</span>
+          </div>
           <div class="stage-title">
             <strong id="previewTitle">本地预览</strong>
             <span id="previewMeta" class="stage-meta">预览未启动</span>
@@ -281,6 +325,10 @@
 
       <div id="cardStage" class="stage-mode card-stage" hidden>
         <header class="stage-bar">
+          <div class="unity-scene-tabs unity-only" aria-label="视图">
+            <span class="unity-scene-tab active">编辑</span>
+            <span class="unity-scene-tab">预览</span>
+          </div>
           <div class="stage-title">
             <strong id="cardStageTitle">角色卡编辑</strong>
             <span id="cardStageMeta" class="stage-meta">未打开卡</span>
@@ -301,6 +349,7 @@
           <form id="cardForm" class="card-form">
             <nav class="card-tabs" aria-label="写卡分类">
               <button type="button" class="card-tab active" data-card-tab="basic">基础</button>
+              <button type="button" class="card-tab" data-card-tab="interact">互动模板</button>
               <button type="button" class="card-tab" data-card-tab="worldbook">世界书</button>
               <button type="button" class="card-tab" data-card-tab="dialogue">对话</button>
               <button type="button" class="card-tab" data-card-tab="media">图片/音色</button>
@@ -367,6 +416,61 @@
                   </div>
                 </label>
               </div>
+            </section>
+
+            <section class="card-tab-panel" data-card-panel="interact" hidden>
+              <div class="st-section">
+                <div class="st-section-head">
+                  <strong>互动模板</strong>
+                </div>
+                <p class="hint">为聊天页添加官方状态面板与剧情选项，模型会在每轮回复后更新它们</p>
+                <div id="stTemplateToggles" class="st-toggles" role="group" aria-label="互动模板开关"></div>
+              </div>
+
+              <div id="stOptionsBox" class="st-box" hidden>
+                <div class="st-section-head"><strong>剧情选项设置</strong></div>
+                <p class="hint">选项由模型每轮现场生成，这里告诉它给几个、按什么风格写</p>
+                <div class="st-options-row">
+                  <label>
+                    <span class="sr-only">选项数量</span>
+                    <select id="stOptionsCount">
+                      <option value="">自动（2~4 个）</option>
+                      <option value="2">2 个</option>
+                      <option value="3">3 个</option>
+                      <option value="4">4 个</option>
+                    </select>
+                  </label>
+                  <label class="grow">
+                    <span class="sr-only">选项提示</span>
+                    <input id="stOptionsHint" type="text" maxlength="120" placeholder="给模型的提示，例如：每条不超过 12 字，至少一条是主动行动">
+                  </label>
+                </div>
+              </div>
+
+              <div id="stFieldsHost" class="st-fields-host"></div>
+
+              <div class="st-section">
+                <div class="st-section-head">
+                  <strong>自定义面板</strong>
+                </div>
+                <p class="hint">自己起名、自己加字段，聊天页右侧会多出一个标签</p>
+                <div id="stPanelsHost" class="st-panels-host"></div>
+                <div class="actions" style="margin-top:8px">
+                  <button type="button" class="btn accent" id="stAddPanelBtn">添加面板</button>
+                </div>
+                <p id="stValidationMsg" class="hint st-warn" hidden>修正以上问题前，面板不会生效</p>
+              </div>
+
+              <div class="st-preview-box">
+                <div class="st-section-head"><strong>预览</strong></div>
+                <div id="stPreview" class="st-preview">未启用</div>
+              </div>
+
+              <label>
+                <span>推荐模型</span>
+                <input id="cardRecommendedModel" type="text" placeholder="新建聊天默认使用该模型，玩家仍可切换">
+              </label>
+              <p class="hint">可选。不填则用账号默认模型。</p>
             </section>
 
             <section class="card-tab-panel" data-card-panel="worldbook" hidden>
@@ -571,10 +675,14 @@
     </main>
 
     <aside class="agent-panel" id="agentPanel" aria-label="官方 AI 助手">
+      <div class="unity-dock-head unity-only">
+        <span class="unity-dock-tab active">控制台</span>
+        <span class="unity-dock-tab">助手</span>
+      </div>
       <header class="agent-head">
         <div class="agent-title">
           <strong>官方助手</strong>
-          <span id="agentMeta" class="agent-meta">Workbench Chat</span>
+          <span id="agentMeta" class="agent-meta">工作台对话</span>
         </div>
         <div class="agent-head-actions">
           <select id="agentBackend" title="Agent 后端">
@@ -587,7 +695,7 @@
       </header>
       <div id="agentMsgs" class="agent-msgs" aria-live="polite">
         <div class="agent-welcome">
-          <p>与官网 Workbench 底部 Chat 同一套官方 Agent。</p>
+          <p>与官网工作台底部对话同一套官方助手。</p>
           <p>需已登录，且「项目配置」里的 character_id 为游戏卡。</p>
         </div>
       </div>
@@ -600,6 +708,36 @@
         <p id="agentHint" class="hint">未连接</p>
       </div>
     </aside>
+
+    <!-- Unity 底部 工程 / 日志 -->
+    <footer class="unity-project unity-only" id="unityProject" aria-label="工程">
+      <div class="unity-dock-head">
+        <button type="button" class="unity-dock-tab active" data-unity-bottom="project">工程</button>
+        <button type="button" class="unity-dock-tab" data-unity-bottom="console">日志</button>
+        <div class="unity-dock-head-spacer"></div>
+        <span class="unity-dock-path" id="unityProjectPath">资源</span>
+      </div>
+      <div class="unity-bottom-body">
+        <div class="unity-bottom-panel active" data-unity-bottom-panel="project">
+          <div class="unity-project-toolbar">
+            <span class="unity-proj-crumb">资源</span>
+            <span class="unity-proj-crumb">›</span>
+            <span class="unity-proj-crumb" id="unityProjCrumb">本地</span>
+          </div>
+          <div class="unity-project-grid" aria-hidden="true">
+            <div class="unity-asset-item is-folder"><span class="unity-asset-icon"></span><span>publish</span></div>
+            <div class="unity-asset-item is-folder"><span class="unity-asset-icon"></span><span>functions</span></div>
+            <div class="unity-asset-item is-folder"><span class="unity-asset-icon"></span><span>docs</span></div>
+            <div class="unity-asset-item"><span class="unity-asset-icon"></span><span>config.json</span></div>
+            <div class="unity-asset-item"><span class="unity-asset-icon"></span><span>index.html</span></div>
+          </div>
+          <p class="unity-project-meta" id="unityProjectMeta">切换主题不会改变功能，仅布局。</p>
+        </div>
+        <div class="unity-bottom-panel" data-unity-bottom-panel="console" hidden>
+          <pre class="unity-console-out" id="unityConsoleOut">日志就绪。</pre>
+        </div>
+      </div>
+    </footer>
   </div>
 
   <div id="textZoomModal" class="text-zoom-modal" hidden>
@@ -611,6 +749,13 @@
       <pre id="textZoomBody" class="text-zoom-body"></pre>
     </div>
   </div>
+
+  <!-- 侧栏收起后左侧：经典 / 编辑器主题切换（不改功能，仅换皮） -->
+  <aside id="themeRail" class="theme-rail" hidden aria-label="界面主题">
+    <p class="theme-rail-label">主题</p>
+    <button type="button" class="theme-rail-btn" id="themeClassicBtn" data-theme="classic" title="经典主题">经典</button>
+    <button type="button" class="theme-rail-btn" id="themeUnityBtn" data-theme="unity" title="编辑器风格主题">编辑器</button>
+  </aside>
 
   <!-- 侧栏收起后：中心发布 + 环绕 菜单/刷新/同步（悬停展开） -->
   <div id="fabDock" class="fab-dock" hidden>

@@ -64,6 +64,7 @@ POST /api/trpc/<procedure>?batch=1   body: {"0":{"json":{...}}}
 3. API：`/api/card/list|get|new|save|ai|cloud|pull`
 4. 云端写入已接：`POST /api/card/publish` → 本地图 + `uploadOrUpdate` / `saveDraft`；上架/下架请官网（控制台不提供按钮）；列表绿标读角色页 `isPublic`/`publishStatus`；游戏卡 pull 会被拒绝
 5. **试玩（平台对话）**：见下节
+6. **互动模板**：写卡 Tab「互动模板」→ `extensions.status_template`（+ 可选 `recommended_model`）；落盘 `extensions.json`；pull/publish 透传；**无新 tRPC**（仍走 saveDraft/uploadOrUpdate）
 
 ## 试玩（平台对话）
 

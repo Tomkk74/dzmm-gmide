@@ -7,9 +7,11 @@
   var publishTimer = null;
   var SIDEBAR_KEY = 'dzmm-console-sidebar-collapsed';
   var AGENT_KEY = 'dzmm-console-agent-collapsed';
+  var THEME_KEY = 'dzmm-console-ui-theme';
   var CONSOLE_MODE_KEY = 'dzmm-console-mode';
   var CONSOLE_CARD_KEY = 'dzmm-console-card-id';
   var consoleMode = 'game'; // game | card
+  var uiTheme = 'classic'; // classic | unity
   var lastGamePanel = 'login';
   var FAB_POS_KEY = 'dzmm-console-fab-pos';
   var FAB_CIRC = 2 * Math.PI * 20; // r=20
@@ -350,6 +352,28 @@
     return !!( $('appShell') && $('appShell').classList.contains('is-card-mode') );
   }
 
+  function syncThemeRail(collapsed) {
+    var rail = $('themeRail');
+    if (!rail) return;
+    // 新旧主题切换只放在「收起后左边」
+    rail.hidden = !collapsed;
+  }
+
+  function setUiTheme(theme, opts) {
+    var next = theme === 'unity' ? 'unity' : 'classic';
+    uiTheme = next;
+    try {
+      document.documentElement.setAttribute('data-ui-theme', next);
+    } catch (_) {}
+    var classicBtn = $('themeClassicBtn');
+    var unityBtn = $('themeUnityBtn');
+    if (classicBtn) classicBtn.classList.toggle('active', next === 'classic');
+    if (unityBtn) unityBtn.classList.toggle('active', next === 'unity');
+    if (!(opts && opts.skipPersist)) {
+      try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+    }
+  }
+
   function setSidebarCollapsed(collapsed) {
     var app = $('appShell');
     var fab = $('fabDock');
@@ -358,10 +382,12 @@
       app.classList.add('is-collapsed');
       // 角色卡全屏不显示游戏 FAB；游戏全屏才显示
       if (fab) fab.hidden = isCardMode();
+      syncThemeRail(true);
       try { localStorage.setItem(SIDEBAR_KEY, '1'); } catch (_) {}
     } else {
       app.classList.remove('is-collapsed');
       if (fab) fab.hidden = true;
+      syncThemeRail(false);
       try { localStorage.setItem(SIDEBAR_KEY, '0'); } catch (_) {}
       setFabProgress(0, 'idle');
     }
@@ -1063,6 +1089,526 @@
     return true;
   }
 
+  var ST_META = {
+    status_bar: { name: '状态栏', desc: '时间、地点、心情等' },
+    relationship: { name: '关系面板', desc: '好感度与关系阶段' },
+    inventory: { name: '背包', desc: '物品列表' },
+    options: { name: '剧情选项', desc: '每轮给出 2~4 个可点选项' },
+  };
+  var ST_DEFAULTS = {
+    status_bar: [
+      { key: 'time', template: 'status_bar', label: '时间', type: 'text', initial: '未知' },
+      { key: 'location', template: 'status_bar', label: '地点', type: 'text', initial: '未知' },
+      { key: 'mood', template: 'status_bar', label: '心情', type: 'text', initial: '平静' },
+    ],
+    relationship: [
+      {
+        key: 'favor', template: 'relationship', label: '好感度', type: 'meter',
+        min: 0, max: 100, initial: 20,
+        hint: '按本轮剧情在当前值基础上合理增减，单轮变化不超过 10',
+      },
+      {
+        key: 'stage', template: 'relationship', label: '关系阶段', type: 'text',
+        initial: '陌生',
+        hint: '按好感度自动：低于 30 陌生，30~59 熟人，60~84 暧昧，85 以上恋人',
+      },
+    ],
+    inventory: [
+      { key: 'inventory', template: 'inventory', label: '背包', type: 'list', initial: [] },
+    ],
+  };
+  var ST_IDS = ['status_bar', 'relationship', 'inventory', 'options'];
+  var ST_FIELD_HOSTS = { status_bar: 1, relationship: 1, inventory: 1 };
+  var statusTemplateUiBound = false;
+
+  function emptyStatusTemplate() {
+    return { version: 1, templates: [], panels: [], fields: [], options: null, theme: null };
+  }
+
+  var statusTemplateState = emptyStatusTemplate();
+
+  function cloneJson(v) {
+    return JSON.parse(JSON.stringify(v));
+  }
+
+  function normalizeStatusTemplateClient(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var templates = [];
+    var seenT = {};
+    (Array.isArray(raw.templates) ? raw.templates : []).forEach(function (t) {
+      var id = String(t || '').trim();
+      if (ST_IDS.indexOf(id) >= 0 && !seenT[id]) {
+        templates.push(id);
+        seenT[id] = 1;
+      }
+    });
+    var panels = [];
+    var panelIds = {};
+    (Array.isArray(raw.panels) ? raw.panels : []).slice(0, 6).forEach(function (p) {
+      if (!p || typeof p !== 'object') return;
+      var id = String(p.id || '').trim();
+      var title = String(p.title || '').trim().slice(0, 12);
+      if (!/^[a-z][a-z0-9_]{0,31}$/.test(id) || ST_IDS.indexOf(id) >= 0 || panelIds[id]) return;
+      panels.push({ id: id, title: title });
+      panelIds[id] = 1;
+    });
+    var allowed = {};
+    templates.forEach(function (t) { if (ST_FIELD_HOSTS[t]) allowed[t] = 1; });
+    Object.keys(panelIds).forEach(function (id) { allowed[id] = 1; });
+    var fields = [];
+    var seenK = {};
+    (Array.isArray(raw.fields) ? raw.fields : []).slice(0, 32).forEach(function (f) {
+      if (!f || typeof f !== 'object') return;
+      var key = String(f.key || '').trim();
+      var host = String(f.template || '').trim();
+      var label = String(f.label || '').trim().slice(0, 20);
+      var type = String(f.type || 'text').trim();
+      if (!/^[a-z][a-z0-9_]{0,31}$/.test(key) || seenK[key]) return;
+      if (!allowed[host] || ['text', 'number', 'meter', 'list'].indexOf(type) < 0) return;
+      var item = { key: key, template: host, label: label, type: type };
+      if (type === 'number' || type === 'meter') {
+        if (f.min != null && f.min !== '') item.min = Number(f.min);
+        if (f.max != null && f.max !== '') item.max = Number(f.max);
+        if (type === 'meter') {
+          if (item.min == null) item.min = 0;
+          if (item.max == null) item.max = 100;
+        }
+      }
+      if (type === 'text' && typeof f.initial === 'string') item.initial = f.initial.slice(0, 200);
+      else if ((type === 'number' || type === 'meter') && typeof f.initial === 'number') item.initial = f.initial;
+      else if (type === 'list' && Array.isArray(f.initial)) item.initial = f.initial.map(function (x) { return String(x).slice(0, 60); }).slice(0, 16);
+      if (f.hint) item.hint = String(f.hint).slice(0, 80);
+      fields.push(item);
+      seenK[key] = 1;
+    });
+    var options = null;
+    if (seenT.options) {
+      var o = (raw.options && typeof raw.options === 'object') ? raw.options : {};
+      options = {};
+      if (o.count != null && o.count !== '') {
+        var count = Math.max(2, Math.min(4, parseInt(o.count, 10) || 3));
+        options.count = count;
+      }
+      if (o.hint) options.hint = String(o.hint).slice(0, 120);
+    }
+    if (!templates.length && !panels.length) return null;
+    return {
+      version: 1,
+      templates: templates,
+      panels: panels,
+      fields: fields,
+      options: options,
+      theme: raw.theme == null ? null : raw.theme,
+    };
+  }
+
+  function setStatusTemplateState(raw) {
+    var n = normalizeStatusTemplateClient(raw);
+    statusTemplateState = n ? n : emptyStatusTemplate();
+  }
+
+  function uniqueFieldKey(base) {
+    var b = String(base || 'custom').replace(/[^a-z0-9_]/g, '_').replace(/^[^a-z]+/, 'c') || 'custom';
+    b = b.slice(0, 28);
+    var key = b;
+    var i = 1;
+    var used = {};
+    (statusTemplateState.fields || []).forEach(function (f) { used[f.key] = 1; });
+    while (used[key]) {
+      i += 1;
+      key = (b + '_' + i).slice(0, 32);
+    }
+    return key;
+  }
+
+  function uniquePanelId() {
+    var used = {};
+    ST_IDS.forEach(function (id) { used[id] = 1; });
+    (statusTemplateState.panels || []).forEach(function (p) { used[p.id] = 1; });
+    var i = 1;
+    var id = 'panel_' + i;
+    while (used[id]) {
+      i += 1;
+      id = 'panel_' + i;
+    }
+    return id;
+  }
+
+  function toggleStatusTemplate(id, on) {
+    var templates = statusTemplateState.templates.slice();
+    var idx = templates.indexOf(id);
+    if (on && idx < 0) {
+      templates.push(id);
+      if (ST_DEFAULTS[id]) {
+        var existing = {};
+        statusTemplateState.fields.forEach(function (f) { existing[f.key] = 1; });
+        ST_DEFAULTS[id].forEach(function (f) {
+          if (!existing[f.key]) statusTemplateState.fields.push(cloneJson(f));
+        });
+      }
+      if (id === 'options' && !statusTemplateState.options) {
+        statusTemplateState.options = {};
+      }
+    } else if (!on && idx >= 0) {
+      templates.splice(idx, 1);
+      statusTemplateState.fields = statusTemplateState.fields.filter(function (f) {
+        return f.template !== id;
+      });
+      if (id === 'options') statusTemplateState.options = null;
+    }
+    statusTemplateState.templates = templates;
+  }
+
+  function escHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function fieldInitialToInput(f) {
+    if (f.type === 'list') {
+      return Array.isArray(f.initial) ? f.initial.join('、') : '';
+    }
+    if (f.initial == null) return '';
+    return String(f.initial);
+  }
+
+  function parseFieldInitial(type, raw) {
+    raw = String(raw == null ? '' : raw);
+    if (type === 'list') {
+      return raw.split(/[、,，\n]/).map(function (s) { return s.trim(); }).filter(Boolean).slice(0, 16);
+    }
+    if (type === 'number' || type === 'meter') {
+      var n = Number(raw);
+      return Number.isFinite(n) ? n : 0;
+    }
+    return raw.slice(0, 200);
+  }
+
+  var ST_TYPE_LABELS = {
+    text: '文本',
+    number: '数字',
+    meter: '进度条',
+    list: '列表',
+  };
+
+  function renderStatusTemplateField(f, index) {
+    var minMax = (f.type === 'number' || f.type === 'meter')
+      ? '<div class="st-field-row-2">' +
+        '<input data-st-f="' + index + '" data-st-k="min" type="number" placeholder="最小" value="' + escHtml(f.min == null ? '' : f.min) + '">' +
+        '<input data-st-f="' + index + '" data-st-k="max" type="number" placeholder="最大" value="' + escHtml(f.max == null ? '' : f.max) + '">' +
+        '</div>'
+      : '';
+    var initialPh = f.type === 'list' ? '用「、」分隔多个物品' : '初始值';
+    var missName = !(f.label || '').trim();
+    return (
+      '<div class="st-field' + (missName ? ' is-invalid' : '') + '" data-st-field-index="' + index + '">' +
+        '<div class="st-field-row">' +
+          '<input class="st-grow" data-st-f="' + index + '" data-st-k="label" type="text" maxlength="20" value="' + escHtml(f.label || '') + '" placeholder="字段名">' +
+          '<select data-st-f="' + index + '" data-st-k="type">' +
+            ['text', 'number', 'meter', 'list'].map(function (t) {
+              return '<option value="' + t + '"' + (f.type === t ? ' selected' : '') + '>' + (ST_TYPE_LABELS[t] || t) + '</option>';
+            }).join('') +
+          '</select>' +
+          '<button type="button" class="btn" data-st-remove-field="' + index + '" title="删除字段">×</button>' +
+        '</div>' +
+        '<input data-st-f="' + index + '" data-st-k="initial" type="text" value="' + escHtml(fieldInitialToInput(f)) + '" placeholder="' + initialPh + '">' +
+        minMax +
+        '<input data-st-f="' + index + '" data-st-k="hint" type="text" maxlength="80" value="' + escHtml(f.hint || '') + '" placeholder="变化规则（可选），例如：每轮增减不超过 10">' +
+        (missName ? '<p class="st-field-err">请填写字段名</p>' : '') +
+      '</div>'
+    );
+  }
+
+  function renderStatusTemplatePreview() {
+    var box = $('stPreview');
+    if (!box) return;
+    var fields = statusTemplateState.fields || [];
+    var templates = statusTemplateState.templates || [];
+    var panels = statusTemplateState.panels || [];
+    if (!fields.length && !templates.length && !panels.length) {
+      box.innerHTML = '<div class="st-preview-empty">未启用</div>';
+      return;
+    }
+    function section(title, idxs) {
+      if (!idxs.length && title !== '剧情选项') return '';
+      var rows = idxs.map(function (i) {
+        var f = fields[i];
+        var val = fieldInitialToInput(f);
+        if (f.type === 'meter') val = (f.initial != null ? f.initial : 0) + '/' + (f.max != null ? f.max : 100);
+        if (f.type === 'list') val = Array.isArray(f.initial) && f.initial.length ? f.initial.join('、') : '空';
+        return '<div class="st-preview-row"><span>' + escHtml(f.label || '（未命名）') + '</span><span>' + escHtml(val === '' ? '—' : val) + '</span></div>';
+      }).join('');
+      return '<div class="st-preview-sec"><div class="st-preview-sec-title">' + escHtml(title) + '</div>' + rows + '</div>';
+    }
+    var html = '';
+    var shortTitle = { status_bar: '状态', relationship: '关系', inventory: '背包' };
+    ['status_bar', 'relationship', 'inventory'].forEach(function (id) {
+      if (templates.indexOf(id) < 0) return;
+      var idxs = [];
+      fields.forEach(function (f, i) { if (f.template === id) idxs.push(i); });
+      html += section(shortTitle[id], idxs);
+    });
+    panels.forEach(function (p) {
+      var idxs = [];
+      fields.forEach(function (f, i) { if (f.template === p.id) idxs.push(i); });
+      html += section(p.title || '自定义', idxs);
+    });
+    if (templates.indexOf('options') >= 0) {
+      var o = statusTemplateState.options || {};
+      var c = o.count ? (o.count + ' 个') : '自动（2~4 个）';
+      html += '<div class="st-preview-sec"><div class="st-preview-sec-title">剧情选项</div><div class="st-preview-row"><span>每轮</span><span>' + escHtml(c) + '</span></div></div>';
+    }
+    box.innerHTML = html || '<div class="st-preview-empty">已启用，暂无字段</div>';
+  }
+
+  function statusTemplateHasIssues() {
+    var bad = false;
+    (statusTemplateState.fields || []).forEach(function (f) {
+      if (!(f.label || '').trim()) bad = true;
+    });
+    (statusTemplateState.panels || []).forEach(function (p) {
+      if (!(p.title || '').trim()) bad = true;
+    });
+    return bad;
+  }
+
+  function renderStatusTemplateUi() {
+    var toggles = $('stTemplateToggles');
+    if (toggles) {
+      toggles.innerHTML = ST_IDS.map(function (id) {
+        var on = (statusTemplateState.templates || []).indexOf(id) >= 0;
+        var m = ST_META[id];
+        return (
+          '<button type="button" class="st-toggle" data-st-toggle="' + id + '" aria-pressed="' + (on ? 'true' : 'false') + '">' +
+            '<span class="st-toggle-name">' + escHtml(m.name) + '</span>' +
+            '<span class="st-toggle-desc">' + escHtml(m.desc) + '</span>' +
+          '</button>'
+        );
+      }).join('');
+    }
+    var optBox = $('stOptionsBox');
+    var hasOpt = (statusTemplateState.templates || []).indexOf('options') >= 0;
+    if (optBox) {
+      if (hasOpt) optBox.removeAttribute('hidden');
+      else optBox.setAttribute('hidden', '');
+    }
+    if (hasOpt) {
+      var o = statusTemplateState.options || {};
+      if ($('stOptionsCount')) {
+        $('stOptionsCount').value = o.count != null ? String(o.count) : '';
+      }
+      if ($('stOptionsHint')) $('stOptionsHint').value = o.hint || '';
+    }
+
+    var host = $('stFieldsHost');
+    if (host) {
+      var groups = [];
+      ['status_bar', 'relationship', 'inventory'].forEach(function (id) {
+        if ((statusTemplateState.templates || []).indexOf(id) < 0) return;
+        var idxs = [];
+        statusTemplateState.fields.forEach(function (f, i) {
+          if (f.template === id) idxs.push(i);
+        });
+        groups.push({ id: id, title: ST_META[id].name, idxs: idxs });
+      });
+      host.innerHTML = groups.map(function (g) {
+        return (
+          '<div class="st-group" data-st-group="' + escHtml(g.id) + '">' +
+            '<div class="st-group-head">' +
+              '<strong>' + escHtml(g.title) + '</strong>' +
+              '<button type="button" class="btn" data-st-add-field="' + escHtml(g.id) + '">添加字段</button>' +
+            '</div>' +
+            g.idxs.map(function (i) { return renderStatusTemplateField(statusTemplateState.fields[i], i); }).join('') +
+          '</div>'
+        );
+      }).join('');
+    }
+
+    var panelsHost = $('stPanelsHost');
+    if (panelsHost) {
+      panelsHost.innerHTML = (statusTemplateState.panels || []).map(function (p, pi) {
+        var idxs = [];
+        statusTemplateState.fields.forEach(function (f, i) {
+          if (f.template === p.id) idxs.push(i);
+        });
+        return (
+          '<div class="st-panel" data-st-panel-index="' + pi + '">' +
+            '<div class="st-panel-head">' +
+              '<input class="st-grow" data-st-p="' + pi + '" data-st-k="title" type="text" maxlength="12" value="' + escHtml(p.title || '') + '" placeholder="标签名（最多 12 字）">' +
+              '<button type="button" class="btn" data-st-add-field="' + escHtml(p.id) + '">添加字段</button>' +
+              '<button type="button" class="btn" data-st-remove-panel="' + pi + '">删除</button>' +
+            '</div>' +
+            idxs.map(function (i) { return renderStatusTemplateField(statusTemplateState.fields[i], i); }).join('') +
+          '</div>'
+        );
+      }).join('') || '';
+    }
+
+    var warn = $('stValidationMsg');
+    if (warn) {
+      if (statusTemplateHasIssues()) warn.removeAttribute('hidden');
+      else warn.setAttribute('hidden', '');
+    }
+    renderStatusTemplatePreview();
+  }
+
+  function readStatusTemplateFromDom() {
+    // fields
+    document.querySelectorAll('[data-st-f]').forEach(function (el) {
+      var i = Number(el.getAttribute('data-st-f'));
+      var k = el.getAttribute('data-st-k');
+      var f = statusTemplateState.fields[i];
+      if (!f || !k) return;
+      var v = el.value;
+      if (k === 'type') {
+        f.type = v;
+        if (v === 'meter') {
+          if (f.min == null) f.min = 0;
+          if (f.max == null) f.max = 100;
+          if (typeof f.initial !== 'number') f.initial = Number(f.min) || 0;
+        } else if (v === 'list' && !Array.isArray(f.initial)) {
+          f.initial = [];
+        } else if (v === 'text' && typeof f.initial !== 'string') {
+          f.initial = String(f.initial == null ? '' : f.initial);
+        }
+      } else if (k === 'initial') {
+        f.initial = parseFieldInitial(f.type, v);
+      } else if (k === 'min' || k === 'max') {
+        if (v === '') delete f[k];
+        else f[k] = Number(v);
+      } else if (k === 'key') {
+        f.key = String(v || '').trim();
+      } else if (k === 'label') {
+        f.label = String(v || '').trim();
+      } else if (k === 'hint') {
+        if (v) f.hint = String(v).slice(0, 80);
+        else delete f.hint;
+      }
+    });
+    document.querySelectorAll('[data-st-p]').forEach(function (el) {
+      var i = Number(el.getAttribute('data-st-p'));
+      var k = el.getAttribute('data-st-k');
+      var p = statusTemplateState.panels[i];
+      if (!p || !k) return;
+      // 与官网一致：界面只改标题；id 由系统自动生成，不给手改
+      if (k === 'title') {
+        p.title = String(el.value || '').trim().slice(0, 12) || p.title || '自定义';
+      }
+    });
+    if ((statusTemplateState.templates || []).indexOf('options') >= 0) {
+      var countRaw = ($('stOptionsCount') && $('stOptionsCount').value) || '';
+      statusTemplateState.options = {};
+      if (countRaw) {
+        statusTemplateState.options.count = Math.max(2, Math.min(4, parseInt(countRaw, 10) || 3));
+      }
+      var hint = ($('stOptionsHint') && $('stOptionsHint').value || '').trim();
+      if (hint) statusTemplateState.options.hint = hint.slice(0, 120);
+      if (!Object.keys(statusTemplateState.options).length) {
+        statusTemplateState.options = {};
+      }
+    } else {
+      statusTemplateState.options = null;
+    }
+  }
+
+  function collectStatusTemplateForSave() {
+    readStatusTemplateFromDom();
+    return normalizeStatusTemplateClient(statusTemplateState);
+  }
+
+  function bindStatusTemplateUi() {
+    if (statusTemplateUiBound) return;
+    statusTemplateUiBound = true;
+    var root = document.querySelector('[data-card-panel="interact"]');
+    if (!root) return;
+    root.addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      var toggle = t.closest('[data-st-toggle]');
+      if (toggle) {
+        readStatusTemplateFromDom();
+        var id = toggle.getAttribute('data-st-toggle');
+        var on = toggle.getAttribute('aria-pressed') !== 'true';
+        toggleStatusTemplate(id, on);
+        renderStatusTemplateUi();
+        updateCardPreview();
+        return;
+      }
+      var addF = t.closest('[data-st-add-field]');
+      if (addF) {
+        readStatusTemplateFromDom();
+        var host = addF.getAttribute('data-st-add-field');
+        statusTemplateState.fields.push({
+          key: uniqueFieldKey('custom'),
+          template: host,
+          label: '',
+          type: 'text',
+          initial: '',
+        });
+        renderStatusTemplateUi();
+        updateCardPreview();
+        return;
+      }
+      var rmF = t.closest('[data-st-remove-field]');
+      if (rmF) {
+        readStatusTemplateFromDom();
+        var fi = Number(rmF.getAttribute('data-st-remove-field'));
+        if (fi >= 0) statusTemplateState.fields.splice(fi, 1);
+        renderStatusTemplateUi();
+        updateCardPreview();
+        return;
+      }
+      var rmP = t.closest('[data-st-remove-panel]');
+      if (rmP) {
+        readStatusTemplateFromDom();
+        var pi = Number(rmP.getAttribute('data-st-remove-panel'));
+        var panel = statusTemplateState.panels[pi];
+        if (panel) {
+          statusTemplateState.fields = statusTemplateState.fields.filter(function (f) {
+            return f.template !== panel.id;
+          });
+          statusTemplateState.panels.splice(pi, 1);
+        }
+        renderStatusTemplateUi();
+        updateCardPreview();
+        return;
+      }
+    });
+    root.addEventListener('change', function (ev) {
+      var t = ev.target;
+      if (!t) return;
+      if (t.matches('[data-st-f], [data-st-p], #stOptionsCount, #stOptionsHint')) {
+        readStatusTemplateFromDom();
+        if (t.getAttribute('data-st-k') === 'type') renderStatusTemplateUi();
+        else renderStatusTemplatePreview();
+        updateCardPreview();
+      }
+    });
+    root.addEventListener('input', function (ev) {
+      var t = ev.target;
+      if (!t) return;
+      if (t.matches('[data-st-f], [data-st-p], #stOptionsHint, #cardRecommendedModel')) {
+        readStatusTemplateFromDom();
+        renderStatusTemplatePreview();
+        updateCardPreview();
+      }
+    });
+    if ($('stAddPanelBtn')) {
+      $('stAddPanelBtn').addEventListener('click', function () {
+        readStatusTemplateFromDom();
+        if ((statusTemplateState.panels || []).length >= 6) return;
+        var id = uniquePanelId();
+        statusTemplateState.panels.push({ id: id, title: '' });
+        // 与官网一致：新建面板默认无字段；标题用「标签名」占位
+        renderStatusTemplateUi();
+        updateCardPreview();
+      });
+    }
+  }
+
   function fillCardForm(card, localId, opts) {
     opts = opts || {};
     var live = !!opts.live;
@@ -1116,8 +1662,17 @@
 
     var ae = document.activeElement;
     var focusInWb = !!(ae && $('cardWbEntries') && $('cardWbEntries').contains(ae));
+    var interactPanel = document.querySelector('[data-card-panel="interact"]');
+    var focusInInteract = !!(ae && interactPanel && interactPanel.contains(ae));
     if (!live || !focusInWb) {
       renderWorldBookEntries(Array.isArray(book.entries) ? book.entries : []);
+    }
+    if (!live || !focusInInteract) {
+      var ext = (d.extensions && typeof d.extensions === 'object') ? d.extensions : {};
+      setStatusTemplateState(ext.status_template);
+      touched = setInputFromDisk('cardRecommendedModel', ext.recommended_model || '') || touched;
+      bindStatusTemplateUi();
+      renderStatusTemplateUi();
     }
     if (!live || (ae !== $('cardAvatarUrl'))) {
       updateAvatarPreview(d.avatar_url || '');
@@ -1131,7 +1686,8 @@
     }
 
     var wbCount = (book.entries && book.entries.length) || 0;
-    var metaBase = (currentCardFolder || ('卡/' + currentCardId)) + ' · 世界书 ' + wbCount + ' 条';
+    var stCount = (statusTemplateState.templates || []).length + (statusTemplateState.panels || []).length;
+    var metaBase = (currentCardFolder || ('卡/' + currentCardId)) + ' · 世界书 ' + wbCount + ' 条 · 互动模板 ' + stCount;
     $('cardStageMeta').textContent = live && touched ? (metaBase + ' · 实时同步') : metaBase;
     updateCardPreview();
     cardApplyingRemote = false;
@@ -1176,6 +1732,16 @@
     base.data.image_info = safeJsonParse($('cardImageInfo') && $('cardImageInfo').value, base.data.image_info || []);
     var voiceRaw = ($('cardVoiceSettings') && $('cardVoiceSettings').value || '').trim();
     base.data.voice_settings = voiceRaw ? safeJsonParse(voiceRaw, base.data.voice_settings || null) : null;
+    var ext = (base.data.extensions && typeof base.data.extensions === 'object')
+      ? JSON.parse(JSON.stringify(base.data.extensions))
+      : {};
+    var st = collectStatusTemplateForSave();
+    if (st) ext.status_template = st;
+    else delete ext.status_template;
+    var recModel = ($('cardRecommendedModel') && $('cardRecommendedModel').value || '').trim();
+    if (recModel) ext.recommended_model = recModel;
+    else delete ext.recommended_model;
+    base.data.extensions = ext;
     base._meta.brief = getCardBrief();
     base.spec = base.spec || 'chara_card_v3';
     base.spec_version = base.spec_version || '3.0';
@@ -2148,6 +2714,20 @@
       lamp.className = 'lamp off';
       lamp.textContent = '未登录';
     }
+    var uLamp = $('unityMenubarLamp');
+    if (uLamp) uLamp.textContent = status.loggedIn ? '在线' : '离线';
+    var uMeta = $('unityProjectMeta');
+    if (uMeta) {
+      var pathLabel = (status.projectPath || '').trim() || '(未设置路径)';
+      var cid = status.characterId || '—';
+      uMeta.textContent = status.loggedIn
+        ? ('编号 ' + cid + ' · ' + pathLabel)
+        : '未登录 · 布局切换不影响功能';
+    }
+    var uPath = $('unityProjectPath');
+    if (uPath) uPath.textContent = status.projectPath ? String(status.projectPath).split(/[/\\]/).pop() || '资源' : '资源';
+    var uCrumb = $('unityProjCrumb');
+    if (uCrumb) uCrumb.textContent = status.characterId ? ('#' + status.characterId) : '本地';
     if (consoleMode === 'card') {
       // 角色卡只要账号态：登录 / 线路 / 剩余时长；不展示游戏 characterId / 工程路径
       $('statusBox').textContent = JSON.stringify({
@@ -2173,6 +2753,10 @@
         hasPassword: status.hasPassword,
         error: status.error || '',
       }, null, 2);
+    }
+    var uConsole = $('unityConsoleOut');
+    if (uConsole && $('statusBox')) {
+      uConsole.textContent = $('statusBox').textContent || '日志就绪。';
     }
     if (status.pull && consoleMode === 'game') renderPull(status.pull);
     if (!opts.skipPreview && status.preview && consoleMode === 'game') renderPreview(status.preview);
@@ -2727,6 +3311,44 @@
   }
   bindCollapse('sidebarCollapseBtn');
   bindCollapse('sidebarCollapseBtn2');
+  bindCollapse('sidebarCollapseBtnUnity');
+
+  (function bindThemeRail() {
+    function onThemeClick(ev) {
+      var btn = ev.currentTarget;
+      var theme = btn && btn.getAttribute('data-theme');
+      if (!theme) return;
+      setUiTheme(theme);
+    }
+    var classicBtn = $('themeClassicBtn');
+    var unityBtn = $('themeUnityBtn');
+    if (classicBtn) classicBtn.addEventListener('click', onThemeClick);
+    if (unityBtn) unityBtn.addEventListener('click', onThemeClick);
+    try {
+      var savedTheme = localStorage.getItem(THEME_KEY);
+      setUiTheme(savedTheme === 'unity' ? 'unity' : 'classic', { skipPersist: true });
+    } catch (_) {
+      setUiTheme('classic', { skipPersist: true });
+    }
+  })();
+
+  (function bindUnityBottomTabs() {
+    var root = $('unityProject');
+    if (!root) return;
+    root.querySelectorAll('[data-unity-bottom]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var name = btn.getAttribute('data-unity-bottom');
+        root.querySelectorAll('[data-unity-bottom]').forEach(function (b) {
+          b.classList.toggle('active', b === btn);
+        });
+        root.querySelectorAll('[data-unity-bottom-panel]').forEach(function (panel) {
+          var on = panel.getAttribute('data-unity-bottom-panel') === name;
+          panel.hidden = !on;
+          panel.classList.toggle('active', on);
+        });
+      });
+    });
+  })();
 
   function applyFabPos(left, top) {
     var dock = $('fabDock');
@@ -3062,8 +3684,14 @@
         if (match) panel.removeAttribute('hidden');
         else panel.setAttribute('hidden', '');
       });
+      if (name === 'interact') {
+        bindStatusTemplateUi();
+        renderStatusTemplateUi();
+      }
     });
   });
+  bindStatusTemplateUi();
+  renderStatusTemplateUi();
 
   if ($('cardWbAddBtn')) {
     $('cardWbAddBtn').addEventListener('click', function () {
@@ -4865,11 +5493,11 @@
       agentState.gameId = data.gameId || '';
       if ($('agentMeta')) {
         $('agentMeta').textContent =
-          'gameId=' + (data.gameId || '—') +
+          '游戏 ' + (data.gameId || '—') +
           (data.editorStatus ? ' · ' + data.editorStatus : '') +
-          (data.ttlSeconds ? ' · ttl ' + data.ttlSeconds + 's' : '');
+          (data.ttlSeconds ? ' · 剩余 ' + data.ttlSeconds + ' 秒' : '');
       }
-      setAgentHint('已连接官方 Agent（' + agentBackend() + '）', true);
+      setAgentHint('已连接官方助手（' + agentBackend() + '）', true);
       return true;
     } catch (e) {
       setAgentHint(String(e.message || e), false);
@@ -4916,8 +5544,8 @@
         agentState.sessionId = data.sessionId;
         if ($('agentMeta')) {
           $('agentMeta').textContent =
-            'gameId=' + (agentState.gameId || '—') +
-            ' · session ' + String(agentState.sessionId).slice(0, 8) + '…';
+            '游戏 ' + (agentState.gameId || '—') +
+            ' · 会话 ' + String(agentState.sessionId).slice(0, 8) + '…';
         }
       }
       var deltas = data.deltas || [];
@@ -5130,8 +5758,8 @@
       if ($('agentCancelBtn')) $('agentCancelBtn').disabled = false;
       if ($('agentMeta')) {
         $('agentMeta').textContent =
-          'gameId=' + (agentState.gameId || '—') +
-          (agentState.sessionId ? ' · session ' + String(agentState.sessionId).slice(0, 8) + '…' : ' · 等待会话…');
+          '游戏 ' + (agentState.gameId || '—') +
+          (agentState.sessionId ? ' · 会话 ' + String(agentState.sessionId).slice(0, 8) + '…' : ' · 等待会话…');
       }
       setAgentHint('官方助手执行中…', true);
       pollOfficialAgent();

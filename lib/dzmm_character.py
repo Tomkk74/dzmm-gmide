@@ -47,6 +47,42 @@ CARDS_DIR = KIT_ROOT / "卡"
 TEMPLATE_DIR = KIT_ROOT / "_模板"
 CHAT_PROMPT_PATH = TEMPLATE_DIR / "开聊提示词.txt"
 
+# 官网「互动模板」extensions.status_template（studio/edit 专业模式）
+STATUS_TEMPLATE_IDS = ("status_bar", "relationship", "inventory", "options")
+STATUS_TEMPLATE_FIELD_HOSTS = ("status_bar", "relationship", "inventory")
+STATUS_TEMPLATE_FIELD_TYPES = ("text", "number", "meter", "list")
+STATUS_TEMPLATE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+STATUS_TEMPLATE_DEFAULTS: dict[str, list[dict]] = {
+    "status_bar": [
+        {"key": "time", "template": "status_bar", "label": "时间", "type": "text", "initial": "未知"},
+        {"key": "location", "template": "status_bar", "label": "地点", "type": "text", "initial": "未知"},
+        {"key": "mood", "template": "status_bar", "label": "心情", "type": "text", "initial": "平静"},
+    ],
+    "relationship": [
+        {
+            "key": "favor",
+            "template": "relationship",
+            "label": "好感度",
+            "type": "meter",
+            "min": 0,
+            "max": 100,
+            "initial": 20,
+            "hint": "按本轮剧情在当前值基础上合理增减，单轮变化不超过 10",
+        },
+        {
+            "key": "stage",
+            "template": "relationship",
+            "label": "关系阶段",
+            "type": "text",
+            "initial": "陌生",
+            "hint": "按好感度自动：低于 30 陌生，30~59 熟人，60~84 暧昧，85 以上恋人",
+        },
+    ],
+    "inventory": [
+        {"key": "inventory", "template": "inventory", "label": "背包", "type": "list", "initial": []},
+    ],
+}
+
 
 def _require_auth(min_remain: int = 30):
     """load_auth 失败会 SystemExit；统一转成 RuntimeError，供卡接口 Exception 捕获。"""
@@ -179,6 +215,140 @@ def _safe_folder_name(name: str) -> str:
     raw = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", raw)
     raw = raw.strip(" .")
     return (raw or "未命名角色")[:80]
+
+
+def _status_template_defaults_for(template_id: str) -> list[dict]:
+    raw = STATUS_TEMPLATE_DEFAULTS.get(template_id) or []
+    return [json.loads(json.dumps(x)) for x in raw]
+
+
+def normalize_status_template(raw) -> dict | None:
+    """规范化官网 extensions.status_template；无效/空则返回 None。"""
+    if not isinstance(raw, dict):
+        return None
+    templates_in = raw.get("templates") if isinstance(raw.get("templates"), list) else []
+    templates: list[str] = []
+    seen_t: set[str] = set()
+    for t in templates_in:
+        tid = str(t or "").strip()
+        if tid in STATUS_TEMPLATE_IDS and tid not in seen_t:
+            templates.append(tid)
+            seen_t.add(tid)
+
+    panels_in = raw.get("panels") if isinstance(raw.get("panels"), list) else []
+    panels: list[dict] = []
+    panel_ids: set[str] = set()
+    reserved = set(STATUS_TEMPLATE_IDS)
+    for p in panels_in[:6]:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id") or "").strip()
+        title = str(p.get("title") or "").strip()[:12]
+        if not STATUS_TEMPLATE_KEY_RE.match(pid) or pid in reserved or pid in panel_ids:
+            continue
+        panels.append({"id": pid, "title": title})
+        panel_ids.add(pid)
+
+    allowed_hosts = {t for t in templates if t in STATUS_TEMPLATE_FIELD_HOSTS} | panel_ids
+    fields_in = raw.get("fields") if isinstance(raw.get("fields"), list) else []
+    fields: list[dict] = []
+    seen_keys: set[str] = set()
+    for f in fields_in[:32]:
+        if not isinstance(f, dict):
+            continue
+        key = str(f.get("key") or "").strip()
+        host = str(f.get("template") or "").strip()
+        label = str(f.get("label") or "").strip()[:20]
+        ftype = str(f.get("type") or "text").strip()
+        if not STATUS_TEMPLATE_KEY_RE.match(key) or key in seen_keys:
+            continue
+        if host not in allowed_hosts or ftype not in STATUS_TEMPLATE_FIELD_TYPES:
+            continue
+        # 字段名可暂时为空（对齐官网「请填写字段名」校验态，本地先落盘）
+        item: dict = {"key": key, "template": host, "label": label, "type": ftype}
+        if ftype in ("number", "meter"):
+            if f.get("min") is not None:
+                try:
+                    item["min"] = float(f["min"])
+                except (TypeError, ValueError):
+                    pass
+            if f.get("max") is not None:
+                try:
+                    item["max"] = float(f["max"])
+                except (TypeError, ValueError):
+                    pass
+            if ftype == "meter":
+                item.setdefault("min", 0)
+                item.setdefault("max", 100)
+        initial = f.get("initial")
+        if ftype == "text" and isinstance(initial, str):
+            item["initial"] = initial[:200]
+        elif ftype in ("number", "meter") and isinstance(initial, (int, float)):
+            item["initial"] = float(initial)
+        elif ftype == "list" and isinstance(initial, list):
+            item["initial"] = [str(x)[:60] for x in initial[:16]]
+        hint = str(f.get("hint") or "").strip()
+        if hint:
+            item["hint"] = hint[:80]
+        fields.append(item)
+        seen_keys.add(key)
+
+    options = None
+    if "options" in templates:
+        opt_raw = raw.get("options") if isinstance(raw.get("options"), dict) else {}
+        options = {}
+        if opt_raw.get("count") not in (None, ""):
+            count = _int_field(opt_raw.get("count"), 3)
+            count = max(2, min(4, count))
+            options["count"] = count
+        hint = str(opt_raw.get("hint") or "").strip()[:120]
+        if hint:
+            options["hint"] = hint
+        # 允许空对象 = 官网「自动（2~4 个）」且无额外提示
+        if not options:
+            options = {}
+
+    if not templates and not panels:
+        return None
+
+    out: dict = {
+        "version": 1,
+        "templates": templates,
+        "panels": panels,
+        "fields": fields,
+        "options": options,
+        "theme": raw.get("theme") if raw.get("theme") is not None else None,
+    }
+    return out
+
+
+def _load_extensions(d: Path, fallback: dict | None = None) -> dict:
+    ext = _read_json(d / "extensions.json", None)
+    if not isinstance(ext, dict):
+        ext = {}
+    if fallback and isinstance(fallback, dict):
+        for k, v in fallback.items():
+            if k not in ext or ext.get(k) in (None, "", {}, []):
+                ext[k] = v
+    st = normalize_status_template(ext.get("status_template"))
+    if st:
+        ext["status_template"] = st
+    elif "status_template" in ext:
+        ext = dict(ext)
+        ext.pop("status_template", None)
+    return ext
+
+
+def _write_extensions(d: Path, extensions) -> dict:
+    ext = dict(extensions) if isinstance(extensions, dict) else {}
+    st = normalize_status_template(ext.get("status_template"))
+    if st:
+        ext["status_template"] = st
+    else:
+        ext.pop("status_template", None)
+    # 空对象也落盘，方便确认已同步
+    _write_json(d / "extensions.json", ext)
+    return ext
 
 
 def _now_iso() -> str:
@@ -469,6 +639,7 @@ def load_from_folder(local_id: str) -> dict:
     # 兼容旧 card.json：补空字段，并保留云端元数据（cloudId / 上架状态）
     jp = d / "card.json"
     old_meta = {}
+    od_extensions = None
     if jp.is_file():
         try:
             old = json.loads(jp.read_text(encoding="utf-8"))
@@ -495,10 +666,13 @@ def load_from_folder(local_id: str) -> dict:
                     data["chat_history"] = od["chat_history"]
                 if od.get("db_id") not in (None, "", -1, "-1") and data.get("db_id") in (None, "", -1, "-1"):
                     data["db_id"] = od.get("db_id")
+                if isinstance(od.get("extensions"), dict):
+                    od_extensions = od["extensions"]
             if isinstance(old, dict) and isinstance(old.get("_meta"), dict):
                 old_meta = dict(old["_meta"])
         except Exception:
             pass
+    data["extensions"] = _load_extensions(d, od_extensions)
     # 若 chat 有首条 AI 而 first_mes 空，回填
     if not data["first_mes"] and data["chat_history"]:
         try:
@@ -621,9 +795,11 @@ def write_folder(card: dict, local_id: str | None = None, *, brief: str | None =
         data["chat_history"] = chat
     _write_json(d / "chat_history.json", chat)
     _write_world_book(d, data.get("character_book") if isinstance(data.get("character_book"), dict) else {})
+    data["extensions"] = _write_extensions(d, data.get("extensions"))
 
     card.setdefault("spec", "chara_card_v3")
     card.setdefault("spec_version", "3.0")
+    card["data"] = data
     meta["localId"] = folder_name
     meta["folder"] = str(d)
     meta["updatedAt"] = _now_iso()
@@ -647,6 +823,8 @@ def write_folder(card: dict, local_id: str | None = None, *, brief: str | None =
             "- `system_prompt.txt` `creator_notes.txt` `tags.txt` "
             "`creator.txt` `character_version.txt`\n"
             "- `first_mes.txt` `brief.txt` `avatar_url.txt`\n\n"
+            "## 互动模板\n"
+            "- `extensions.json`（含 `status_template` / `recommended_model`）\n\n"
             "## 世界书 worldbook\n"
             "- `character_book/name.txt`\n"
             "- `character_book/entries/001/`：`name.txt` `keys.txt` `content.txt` "
@@ -1823,25 +2001,19 @@ def upload_character_image(raw: bytes, filename: str = "image.png") -> str:
             f"--{boundary}--\r\n".encode(),
         ]
     )
-    req = urllib.request.Request(
+    st, raw, _ = studio.http(
         f"{studio.get_origin()}/api/trpc/studio.uploadCharacterImage?batch=1",
-        data=body,
+        cookie,
+        token,
         method="POST",
-        headers={
-            "Cookie": cookie,
-            "Authorization": f"Bearer {token}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-            "Origin": studio.get_origin(),
-            "Referer": f"{studio.get_origin()}/studio/edit",
-            "User-Agent": "Mozilla/5.0 DZMM-Studio-Bridge",
-        },
+        raw_body=body,
+        content_type=f"multipart/form-data; boundary={boundary}",
+        timeout=120,
+        accept="application/json",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            obj = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"图片上传失败 HTTP {e.code}: {e.read()[:300]!r}") from e
+    if st != 200:
+        raise RuntimeError(f"图片上传失败 HTTP {st}: {raw[:300]!r}")
+    obj = json.loads(raw.decode("utf-8", "replace"))
     if isinstance(obj, list) and obj:
         data = (((obj[0] or {}).get("result") or {}).get("data") or {}).get("json") or {}
     else:
@@ -1939,6 +2111,18 @@ def prepare_raw_data_for_cloud(local_id: str, card: dict) -> dict:
     cb = data.get("character_book")
     if not isinstance(cb, dict):
         data["character_book"] = {"name": "世界设定", "entries": [], "extensions": {}}
+    # extensions：规范化互动模板；空则去掉 status_template
+    ext = data.get("extensions") if isinstance(data.get("extensions"), dict) else {}
+    ext = dict(ext)
+    st = normalize_status_template(ext.get("status_template"))
+    if st:
+        ext["status_template"] = st
+    else:
+        ext.pop("status_template", None)
+    if ext:
+        data["extensions"] = ext
+    else:
+        data.pop("extensions", None)
     return {
         "spec": card.get("spec") or "chara_card_v3",
         "spec_version": card.get("spec_version") or "3.0",
